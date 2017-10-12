@@ -168,9 +168,7 @@ static int LuaTundraDigestGuid(lua_State* L)
   char result[kDigestStringSize];
   DigestToString(result, digest);
   // Pad to 40 characters for compat between xxfast/SHA1
-  char output[41] = { 0 };
-  memcpy(output, result, kDigestStringSize);
-  lua_pushlstring(L, output, 40);
+  lua_pushstring(L, result);
   return 1;
 }
 
@@ -466,10 +464,25 @@ static int LuaWin32RegisterQuery(lua_State *L)
 
   }
 
-
   lua_pushnil(L);
   PushWin32Error(L, ERROR_FILE_NOT_FOUND, "RegOpenKeyExA");
   return 2;
+}
+
+static int LuaWin32FindWindow(lua_State *L)
+{
+  const char *className, *windowName;
+
+  windowName = luaL_checkstring(L, 1);
+
+  HWND hWnd = ::FindWindowA(NULL, windowName);
+  if (hWnd == NULL) {
+	  lua_pushinteger(L, 0);
+  }
+  else {
+	  lua_pushinteger(L, 1);
+  }
+  return 1;
 }
 #endif
 
@@ -506,6 +519,7 @@ static const luaL_Reg s_LuaFunctions[] = {
   { "timerdiff",        LuaTimeDiff },
 #ifdef _WIN32
   { "reg_query",        LuaWin32RegisterQuery },
+  { "win32_find_window",LuaWin32FindWindow },
 #endif
   { NULL, NULL }
 };
