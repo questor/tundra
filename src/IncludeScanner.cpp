@@ -180,6 +180,9 @@ ScanLineGeneric(MemAllocLinear* allocator, const char *start_in, const GenericSc
       case '<':
         closing_separator = '>';
         break;
+      case '>': // A really crude way to match <file>path...</file> in QRC files.
+        closing_separator = '<';
+        break;
       case '"':
         closing_separator = '"';
         break;

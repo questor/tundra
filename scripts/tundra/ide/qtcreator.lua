@@ -1,4 +1,5 @@
--- Xcode 5 Workspace/Project file generation
+-- QtCreator Workspace/Project file generation
+-- IdeGenerationHints.QtCreator.SolutionName can be used to set the name of the main solution file
 
 module(..., package.seeall)
 
@@ -214,6 +215,8 @@ end
 function qtcreator_generator:generate_files(ngen, config_tuples, raw_nodes, env, default_names, hints, ide_script)
   assert(config_tuples and #config_tuples > 0)
 
+  print("generated qtcreator file can not be used out-of-the-box to compile the project!")
+
   hints = hints or {}
   hints = hints.QtCreator or {}
   local base_dir = hints.BaseDir and (hints.BaseDir .. '/') or env:interpolate('$(OBJECTROOT)$(SEP)')
@@ -232,7 +235,7 @@ function qtcreator_generator:generate_files(ngen, config_tuples, raw_nodes, env,
 
   local solution_hints = hints.Projects
   if not solution_hints then
-    print("No IdeGenerationHints.QtCreator.Projects specified - using defaults")
+    --print("No IdeGenerationHints.QtCreator.Projects specified - using defaults")
     solution_hints = {
       ['tundra-generated.sln'] = { }
     }

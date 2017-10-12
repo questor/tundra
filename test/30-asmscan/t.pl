@@ -7,7 +7,11 @@ Build {
 		Config {
 			Name = "foo-bar",
 			Tools = { "yasm", "gcc" },
-			Env = { },
+      Env = {
+        ASMINCPATH = {
+          "incy",
+        },
+      },
       DefaultOnHost = { native.host_platform },
 		}
 	},
@@ -21,7 +25,7 @@ Build {
 }
 END
 
-my $obj_file = '__result/foo__asm.o';
+my $obj_file = '__result/foo-asm-541f0091dd54cc51f562e674e41814ab.o';
 
 my $foo_asm = <<END;
 	%include "include1.i" 
@@ -42,7 +46,7 @@ sub run_test($$) {
 
 		run_tundra 'foo-bar';
 		my $sig2 = md5_output_file $obj_file;
-		fail "failed to rebuild when header changed" if $sig1 eq $sig2;
+    fail "failed to rebuild when included file changed" if $sig1 eq $sig2;
 	});
 }
 
@@ -91,6 +95,40 @@ sub test4() {
 	});
 }
 
+sub test5() {
+  run_test({
+    'tundra.lua' => $build_file,
+    'foo.asm' => "\t\tincbin \"bar.bin\"\n",
+    'bar.bin' => "something\n"
+  }, sub {
+    update_file 'bar.bin', "something else\n";
+  });
+}
+sub test6 {
+  my $files = {
+    'tundra.lua' => $build_file,
+    'foo.asm' => "\t\tincbin \"bar.bin\"\n",
+    'bar.bin' => "include 'bar.i'\n",
+    'bar.i' => "whatever\n"
+  };
+  with_sandbox($files, sub {
+    run_tundra 'foo-bar';
+    my $sig1 = md5_output_file $obj_file;
+    update_file 'bar.i', 'something else';
+    run_tundra 'foo-bar';
+    my $sig2 = md5_output_file $obj_file;
+    fail "incbin file was scanned for dependencies" if $sig1 ne $sig2;
+  });
+}
+sub test7 {
+  run_test({
+    'tundra.lua' => $build_file,
+    'foo.asm' => "\t\tincbin \"header.i\"\n",
+    'incy/header.i' => "\tmov eax, 1\n"
+  }, sub {
+    update_file 'incy/header.i', "\tmov eax, 2\n";
+  });
+}
 deftest {
 	name => "yasm (generic) include scanning",
 	procs => [
@@ -98,5 +136,8 @@ deftest {
 		"Second level" => \&test2,
 		"Parent directory" => \&test3,
 		"Sibling directory" => \&test4,
+    "Basic incbin" => \&test5,
+    "incbin doesn't follow" => \&test6,
+    "Incbin via ASMINCPATH" => \&test7,
 	],
 };
