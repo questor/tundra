@@ -128,6 +128,7 @@ If we now run Tundra on this input, it will build our +HelloWorld+ executable.
 The output path shows that tundra has defaulted the variant to `debug` and the
 subvariant to `default`.
 
+[source, sh]
 -------------------------------------------------------------------------------
 $ tundra2
 Cc hello.c
@@ -137,6 +138,7 @@ Program t2-output/macosx-gcc-debug-default/HelloWorld
 
 The next mandatory step is of course to display the famous greeting:
 
+[source, sh]
 -------------------------------------------------------------------------------
 $ t2-output/macosx-gcc-debug-default/HelloWorld
 hello, world
@@ -159,9 +161,17 @@ useful for DIY installs or to check into source control.
 === Installing from source
 
 Tundra can be obtained from the official GIT repository:
-`git://github.com:deplinenoise/tundra.git`.
+`git://github.com:deplinenoise/tundra.git`. Tundra uses Google's test framework
+for the unit tests, which must be made available via the Git submodule
+mechanism:
 
-* On Windows, there are two options:
+[source, sh]
+-------------------------------------------------------------------------------
+$ git submodule init
+$ git submodule update
+-------------------------------------------------------------------------------
+
+* On Windows, there are two options for building:
 
   ** Use Visual Studio 2012. The solution file is `vs2012/Tundra.sln`.
 	 After building you will need to copy `vs2012/x64/Release/*.exe` to a `bin`
@@ -280,7 +290,7 @@ Build {
     DefaultVariant = "...",
     SubVariants = { ... },
     DefaultSubVariant = "...",
-    ScriptsDirs = { ... },
+    ScriptDirs = { ... },
     SyntaxExtensions = { ... },
     Passes = { ... },
     ContentDigestExtensions { ... },
@@ -493,7 +503,7 @@ Variants = {
 
 ==== Variant Options
 
-Previously, the only currently recognized option was `GeneratePdb', 
+Previously, the only currently recognized option was `GeneratePdb',
 which caused the MSVC toolset to generate debugging files in PDB format.
 
 This option has however been superseded by the environment variable GENERATE_PDB.
@@ -779,11 +789,14 @@ are supported:
 -------------------------------------------------------------------------------
 
 === Rust Units
+
 Tundra has basic support for Rust programs, crates and shared libraries. The following unit types
 are supported:
+
 - `RustProgram` - Builds a Rust executable
 - `RustCrate` - Builds a Rust create
 - `RustSharedLibrary` - Builds a Rust library (dll)
+
 .Rust Unit Synopsis
 [source,lua]
 -------------------------------------------------------------------------------
@@ -796,42 +809,57 @@ are supported:
     Depends = { ... },      -- config filtered
 }
 -------------------------------------------------------------------------------
+
 Tundra will call Cargo to build Rust projects so a Cargo.toml needs to be
 configured (which is the standard way to setup Rust projects) Cargo doesn't support
 command-line args for linking libs so Tundra will set some env variables that
 a Cargo build script that will use to link with the correct libs.
+
 The build.rs will need to look like this (if you use your own the following code
 needs to be added)
+
 .Rust build.rs Synopsis
-[source,rust]
 -------------------------------------------------------------------------------
 use std::env;
+
 fn main() {
     let tundra_dir = env::var("TUNDRA_OBJECTDIR").unwrap_or("".to_string());
     let libs = env::var("TUNDRA_STATIC_LIBS").unwrap_or("".to_string());
+
     let native_libs = libs.split(" ");
+
     println!("cargo:rustc-link-search=native={}", tundra_dir);
+
     for lib in native_libs {
         println!("cargo:rustc-link-lib=static={}", lib);
         println!("cargo:rerun-if-changed={}", lib);
     }
 }
 -------------------------------------------------------------------------------
-It is also possible to override the Cargo command line 
+
+It is also possible to override the Cargo command line and add flags to rustc
+
 [source,lua]
 -------------------------------------------------------------------------------
 Env = {
-	RUST_CARGO_OPTS = { 
+	-- Extra cargo options
+	RUST_CARGO_OPTS = {
 		{ "..."; Config = "..." },
 	},
+	-- Extra flags for rustc, this shows how to prefer-dynamic linking
+	RUST_OPTS = "-C prefer-dynamic"
 }
 -------------------------------------------------------------------------------
-This can be useful for using Cargo's built-in support for testing or enabling 
+
+This can be useful for using Cargo's built-in support for testing or enabling
 more verbose output for example.
+
 In the examples/rust directory in the Tundra distribution there is examples
 that shows how this is used in practice.
-Notice about Windows: Due to a bug that was detected in Cargo when implementing 
+
+Notice about Windows: Due to a bug that was detected in Cargo when implementing
 this feature Rust 1.7+ (Beta) is required on Windows.
+
 === Syntax Extensions
 
 Tundra provides a small set of syntax extensions by default. To use syntax
@@ -926,15 +954,15 @@ Program {
 -------------------------------------------------------------------------------
 
 If you wish to exclude files based on a pattern you can specify a configuration
-that doesn't exist. In the above example the pattern `[/\\]_[^/\\]*$` will ignore all 
+that doesn't exist. In the above example the pattern `[/\\]_[^/\\]*$` will ignore all
 files where the file name starts with `_`.
 
-The initial seperator is necessary as tundra passes the full path before 
-applying the filter (note: we need a character class that matches both POSIX and 
+The initial seperator is necessary as tundra passes the full path before
+applying the filter (note: we need a character class that matches both POSIX and
 Win32 style paths if we want this to work on all platforms).
 
-Lua patterns are not regular expressions but they are closely related. Instead 
-of using backslash, `%` is used to reference predefined character classes or 
+Lua patterns are not regular expressions but they are closely related. Instead
+of using backslash, `%` is used to reference predefined character classes or
 escape reserved characters but there's no support for repetitions of captures
 or alternations.
 
@@ -1234,6 +1262,89 @@ architecture:
     }
 -------------------------------------------------------------------------------
 
+=== msvc-latest
+
+This toolset is for use with the more recent versions of Visual Studio starting
+with Visual Studio 2017. It is similar to the existing `msvc` toolsets but
+because of how these new versions are installed this toolset can be customized
+to select a particular version and product to use. You don't have to specify
+anything but you have control over it.
+
+The behaviour outlined here should be very similar to the Developer Command
+Prompt for VS (`VsDevCmd.bat`):
+
+- Starting with Visual Studio 2017 `msvc-vs20xx` is just an alias for
+`{"msvc-latest", Version = "20xx" }`. If you use `msvc-latest` directly without
+specifying a version it will fallback to the most recently tested version of
+Visual Studio which is (as of writing) 2022.
+
+- If you don't specify product it will try all of them, in this order:
+`BuildTools`, `Community`, `Professional`, `Enterprise` and use the first one
+which has the *Desktop development with C++* workload installed.
+
+- If you don't specify Windows SDK version you will get the one installed with
+the highest version number.
+
+- If you don't specify MSVC tools version you will get the default (as given by
+`<Path>\<Version>\<Product>` followed by
+`VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt`).
+
+- Path is just for completness and will default to either `C:\Program Files (x86)` or
+ `C:\Program Files` depending on `Version`.
+
+Here's a complete example of how this toolset can be configured:
+
+[source,lua]
+-------------------------------------------------------------------------------
+    Tools = {
+        {
+          "msvc-latest",
+          Path = "C:\\Program Files (x86)\\Microsoft Visual Studio",
+          Version = "2019",
+          Product = "BuildTools",
+          HostArch = "x64", -- "x64" (default), "x86", "arm" or "arm64"
+          TargetArch = "x64", -- "x64" (default), "x86", "arm" or "arm64"
+          WindowsSdkVersion = "10.0.22621.0",
+          VcToolsVersion = "14.29.30133",
+          AppPlatform = "Desktop", -- "Desktop" (default), "UWP" or "OneCore"
+          AtlMfc = false
+        }
+    }
+-------------------------------------------------------------------------------
+
+When you are not being explicit about the Windows SDK version or MSVC tools
+version it will tell you what it ended up chosing during DAG generation. This is
+done so that you can more easily lock your configuration to a specific version,
+if you want to.
+
+[source,lua]
+-------------------------------------------------------------------------------
+    > tundra2 -f -G
+    3 valid build tuples
+    Generating DAG for win64-msvc-release-default
+      WindowsSdkVersion : 10.0.22621.0
+      VcToolsVersion    : 14.29.30133
+    Generating DAG for win64-msvc-debug-default
+      WindowsSdkVersion : 10.0.22621.0
+      VcToolsVersion    : 14.29.30133
+    Generating DAG for win64-msvc-production-default
+      WindowsSdkVersion : 10.0.22621.0
+      VcToolsVersion    : 14.29.30133
+    save_dag_data: 3 bindings, 29 accessed files
+    compiling mmapable DAG data..
+    *** Build success (0.05 seconds)
+-------------------------------------------------------------------------------
+
+In Visual Studio 2017 and later, MFC and ATL are optional sub-components under
+the Desktop development with C++ workload in the Visual Studio Installer
+program. If you want to use MFC and ATL you have to install them and opt-in via
+`AtlMfc = true`.
+
+The idea behind this toolset is that it will be compatible with future Visual
+Studio releases and in the rare case that it isn't, it can be made to work by
+simply changing the `Path`, `Version` and `Product` options to whatever you
+need.
+
 == Extending Tundra
 
 Tundra can be extended in three ways:
@@ -1258,7 +1369,7 @@ the following toolset types can be created:
 
 [width="90%",cols="2,4,5,3",options="header"]
 |=============================================================================
-|Language     |Base toolset         |Unit driver                | Examples     
+|Language     |Base toolset         |Unit driver                | Examples
 |Assembly     |`generic-asm.lua`    |`tundra.nodegen.native`    | `yasm`
 |C and C++    |`generic-cpp.lua`    |`tundra.nodegen.native`    | `gcc`, `msvc`
 |.NET         |`generic-dotnet.lua` |`tundra.nodegen.dotnet`    | `mono`, `dotnet`
@@ -1454,7 +1565,7 @@ local _native_mt = nodegen.create_eval_subclass {
         Frameworks = "FRAMEWORKS",
         LibPaths = "LIBPATH",
     },
-} 
+}
 -------------------------------------------------------------------------------
 
 The blueprint mechanism saves you from having to validate user input in your

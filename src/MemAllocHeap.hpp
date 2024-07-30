@@ -10,29 +10,17 @@
 namespace t2
 {
 
-namespace HeapFlags
-{
-  enum Enum
-  {
-    kThreadSafe     = 1 << 0,
-    kDefault        = 0
-  };
-}
-
 struct MemAllocHeap
 {
-  void*     m_MemSpace;
-  uint32_t  m_Flags;
-  Mutex     m_Lock;
 };
 
-void HeapInit(MemAllocHeap* heap, size_t capacity, uint32_t flags);
+void HeapInit(MemAllocHeap* heap);
 void HeapDestroy(MemAllocHeap* heap);
 
 void* HeapAllocate(MemAllocHeap* heap, size_t size);
 void* HeapAllocateAligned(MemAllocHeap* heap, size_t size, size_t alignment);
 
-void HeapFree(MemAllocHeap* heap, void *ptr);
+void HeapFree(MemAllocHeap* heap, const void *ptr);
 
 void* HeapReallocate(MemAllocHeap* heap, void *ptr, size_t size);
 

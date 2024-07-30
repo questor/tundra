@@ -24,6 +24,10 @@
 #include <sys/sysctl.h>
 #endif
 
+#if defined(TUNDRA_LINUX)
+#include <thread>
+#endif
+
 #if defined(TUNDRA_WIN32)
 #include <windows.h>
 #include <ctype.h>
@@ -53,8 +57,8 @@ void InitCommon(void)
 {
 #if defined(TUNDRA_WIN32)
   static LARGE_INTEGER freq;
-	if (!QueryPerformanceFrequency(&freq))
-		CroakErrno("QueryPerformanceFrequency failed");
+  if (!QueryPerformanceFrequency(&freq))
+    CroakErrno("QueryPerformanceFrequency failed");
   s_PerfFrequency = double(freq.QuadPart);
 
   SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX | SEM_NOALIGNMENTFAULTEXCEPT);
@@ -82,6 +86,15 @@ void NORETURN CroakErrno(const char* fmt, ...)
   va_end(args);
   fprintf(stderr, "\n");
   fprintf(stderr, "errno: %d (%s)\n", errno, strerror(errno));
+#if defined(TUNDRA_WIN32)
+  DWORD gle = GetLastError();
+
+  char* message = nullptr;
+  size_t size = FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                                 NULL, gle, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (char*)&message, 0, NULL);
+    
+  fprintf(stderr, "Win32 GLE: %u (%s)\n", gle, message);
+#endif
   if (DebuggerAttached())
     abort();
   else
@@ -100,68 +113,58 @@ void NORETURN CroakAbort(const char* fmt, ...)
 
 uint32_t Djb2Hash(const char *str_)
 {
-	const uint8_t *str = (const uint8_t *) str_;
-	uint32_t hash      = 5381;
-	int c;
+  const uint8_t *str = (const uint8_t *) str_;
+  uint32_t hash      = 5381;
+  int c;
 
-	while (0 != (c = *str++))
-	{
-		hash = (hash * 33) + c;
-	}
+  while (0 != (c = *str++))
+  {
+    hash = (hash * 33) + c;
+  }
 
-	return hash;
+  return hash ? hash : 1;
 }
 
 uint64_t Djb2Hash64(const char *str_)
 {
-	const uint8_t *str = (const uint8_t *) str_;
-	uint64_t hash      = 5381;
-	int c;
+  const uint8_t *str = (const uint8_t *) str_;
+  uint64_t hash      = 5381;
+  int c;
 
-	while (0 != (c = *str++))
-	{
-		hash = (hash * 33) + c;
-	}
+  while (0 != (c = *str++))
+  {
+    hash = (hash * 33) + c;
+  }
 
-	return hash;
+  return hash ? hash : 1;
 }
 
 uint32_t Djb2HashNoCase(const char *str_)
 {
-	const uint8_t *str = (const uint8_t *) str_;
-	uint32_t hash = 5381;
-	int c;
+  const uint8_t *str = (const uint8_t *) str_;
+  uint32_t hash = 5381;
+  int c;
 
-	while (0 != (c = *str++))
-	{
-    // Branch free case folding for ASCII
-    const int is_upper     = -(uint32_t(c - 'A') <= uint32_t('Z' - 'A'));
-    const int lower_case_c = c | 0x20;
-    const int nocase_c     = (lower_case_c & is_upper) | (c & ~is_upper);
+  while (0 != (c = *str++))
+  {
+    hash = (hash * 33) + FoldCase(c);
+  }
 
-		hash = (hash * 33) + nocase_c;
-	}
-
-	return hash;
+  return hash ? hash : 1;
 }
 
 uint64_t Djb2HashNoCase64(const char *str_)
 {
-	const uint8_t *str = (const uint8_t *) str_;
-	uint64_t hash = 5381;
-	int c;
+  const uint8_t *str = (const uint8_t *) str_;
+  uint64_t hash = 5381;
+  int c;
 
-	while (0 != (c = *str++))
-	{
-    // Branch free case folding for ASCII
-    const int is_upper     = -(uint32_t(c - 'A') <= uint32_t('Z' - 'A'));
-    const int lower_case_c = c | 0x20;
-    const int nocase_c     = (lower_case_c & is_upper) | (c & ~is_upper);
+  while (0 != (c = *str++))
+  {
+    hash = (hash * 33) + FoldCase(c);
+  }
 
-		hash = (hash * 33) + nocase_c;
-	}
-
-	return hash;
+  return hash ? hash : 1;
 }
 
 static int s_LogFlags = 0;
@@ -205,12 +208,12 @@ void Log(LogLevel level, const char* fmt, ...)
 void GetCwd(char* buffer, size_t buffer_size)
 {
 #if defined(TUNDRA_WIN32)
-	DWORD res = GetCurrentDirectoryA((DWORD)buffer_size, buffer);
-	if (0 == res || ((DWORD)buffer_size) <= res)
-		Croak("couldn't get working directory");
+  DWORD res = GetCurrentDirectoryA((DWORD)buffer_size, buffer);
+  if (0 == res || ((DWORD)buffer_size) <= res)
+    Croak("couldn't get working directory");
 #elif defined(TUNDRA_UNIX)
-	if (NULL == getcwd(buffer, buffer_size))
-		Croak("couldn't get working directory");
+  if (NULL == getcwd(buffer, buffer_size))
+    Croak("couldn't get working directory");
 #else
 #error Unsupported platform
 #endif
@@ -281,15 +284,15 @@ uint32_t NextPowerOfTwo(uint32_t val)
 uint64_t TimerGet()
 {
 #if defined(TUNDRA_UNIX)
-	struct timeval t;
-	if (0 != gettimeofday(&t, NULL))
-		CroakErrno("gettimeofday failed");
+  struct timeval t;
+  if (0 != gettimeofday(&t, NULL))
+    CroakErrno("gettimeofday failed");
   return t.tv_usec + uint64_t(t.tv_sec) * 1000000;
 #elif defined(TUNDRA_WIN32)
-	LARGE_INTEGER c;
-	if (!QueryPerformanceCounter(&c))
-		CroakErrno("QueryPerformanceCounter failed");
-	return c.QuadPart;
+  LARGE_INTEGER c;
+  if (!QueryPerformanceCounter(&c))
+    CroakErrno("QueryPerformanceCounter failed");
+  return c.QuadPart;
 #endif
 }
 
@@ -310,28 +313,28 @@ double TimerDiffSeconds(uint64_t start, uint64_t end)
 bool MakeDirectory(const char* path)
 {
 #if defined(TUNDRA_UNIX)
-	int rc = mkdir(path, 0777);
-	if (0 == rc || EEXIST == errno)
-		return true;
-	else
-		return false;
+  int rc = mkdir(path, 0777);
+  if (0 == rc || EEXIST == errno)
+    return true;
+  else
+    return false;
 #elif defined(TUNDRA_WIN32)
-	/* pretend we can always create device roots */
-	if (isalpha(path[0]) && 0 == memcmp(&path[1], ":\\\0", 3))
-		return true;
+  /* pretend we can always create device roots */
+  if (isalpha(path[0]) && 0 == memcmp(&path[1], ":\\\0", 3))
+    return true;
 
-	if (!CreateDirectoryA(path, NULL))
-	{
-		switch (GetLastError())
-		{
-		case ERROR_ALREADY_EXISTS:
-			return true;
-		default:
-			return false;
-		}
-	}
-	else
-		return true;
+  if (!CreateDirectoryA(path, NULL))
+  {
+    switch (GetLastError())
+    {
+    case ERROR_ALREADY_EXISTS:
+      return true;
+    default:
+      return false;
+    }
+  }
+  else
+    return true;
 #endif
 
 }
@@ -339,14 +342,16 @@ bool MakeDirectory(const char* path)
 int GetCpuCount()
 {
 #if defined(TUNDRA_WIN32)
-	SYSTEM_INFO si;
-	GetSystemInfo(&si);
-	return (int) si.dwNumberOfProcessors;
+  SYSTEM_INFO si;
+  GetSystemInfo(&si);
+  return (int) si.dwNumberOfProcessors;
+#elif defined(TUNDRA_LINUX)
+  return (int)std::thread::hardware_concurrency();
 #else
-	long nprocs_max = sysconf(_SC_NPROCESSORS_CONF);
-	if (nprocs_max < 0)
-		CroakErrno("couldn't get CPU count");
-	return (int) nprocs_max;
+  long nprocs_max = sysconf(_SC_NPROCESSORS_CONF);
+  if (nprocs_max < 0)
+    CroakErrno("couldn't get CPU count");
+  return (int) nprocs_max;
 #endif
 }
 

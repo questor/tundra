@@ -8,6 +8,8 @@
 #include "Stats.hpp"
 #include "MemoryMappedFile.hpp"
 #include "SortedArrayUtil.hpp"
+#include "HashTable.hpp"
+#include "Profiler.hpp"
 
 #include <algorithm>
 #include <time.h>
@@ -137,7 +139,7 @@ bool ScanCacheLookup(ScanCache* self, const HashDigest& key, uint64_t timestamp,
         for (int i = 0; i < file_count; ++i)
         {
           output[i].m_Filename = entry->m_IncludedFiles[i].m_Filename;
-          output[i].m_Hash     = entry->m_IncludedFiles[i].m_Hash;
+          output[i].m_FilenameHash = entry->m_IncludedFiles[i].m_FilenameHash;
         }
 
         result_out->m_IncludedFileCount = file_count;
@@ -278,7 +280,7 @@ void ScanCacheInsert(
     for (int i = 0; i < count; ++i)
     {
       record->m_Includes[i].m_Filename = StrDup(self->m_Allocator, included_files[i]);
-      record->m_Includes[i].m_Hash     = Djb2HashPath(included_files[i]);
+      record->m_Includes[i].m_FilenameHash = Djb2HashPath(included_files[i]);
     }
 
     if (is_fresh)
@@ -360,10 +362,26 @@ static bool ScanCacheWriterFlush(ScanCacheWriter* self, const char* filename)
   return BinaryWriterFlush(&self->m_Writer, filename);
 }
 
+static void WriteUniqueStringPointer(HashTable<BinaryLocator, kFlagPathStrings>* atoms, BinarySegment* out_segment, BinarySegment* string_segment, uint32_t hash, const char* filename)
+{
+  if (const BinaryLocator* l = HashTableLookup(atoms, hash, filename))
+  {
+    BinarySegmentWritePointer(out_segment, *l);
+    return;
+  }
+
+  BinaryLocator pos = BinarySegmentPosition(string_segment);
+  HashTableInsert(atoms, hash, filename, pos);
+
+  BinarySegmentWritePointer(out_segment, pos);
+  BinarySegmentWriteStringData(string_segment, filename);
+}
+
 // Save frozen record unless timestamp is too old
 template <typename T>
 static void SaveRecord(
     ScanCacheWriter*    self,
+    HashTable<BinaryLocator, kFlagPathStrings>* atoms,
     const HashDigest*   digest,
     T*                  includes,
     int                 include_count,
@@ -381,9 +399,8 @@ static void SaveRecord(
 
   for (int i = 0; i < include_count; ++i)
   {
-    BinarySegmentWritePointer(array_seg, BinarySegmentPosition(string_seg));
-    BinarySegmentWriteUint32(array_seg, includes[i].m_Hash);
-    BinarySegmentWriteStringData(string_seg, includes[i].m_Filename);
+    WriteUniqueStringPointer(atoms, array_seg, string_seg, includes[i].m_FilenameHash, includes[i].m_Filename);
+    BinarySegmentWriteUint32(array_seg, includes[i].m_FilenameHash);
   }
 
   BinarySegmentWrite(digest_seg, (const char*) digest->m_Data, sizeof(HashDigest));
@@ -400,10 +417,14 @@ static void SaveRecord(
 bool ScanCacheSave(ScanCache* self, const char* fn, MemAllocHeap* heap)
 {
   TimingScope timing_scope(nullptr, &g_Stats.m_ScanCacheSaveTime);
+  ProfilerScope prof_scope("Tundra SaveScanCache", 0);
 
   MemAllocLinear* scratch = self->m_Allocator;
 
   MemAllocLinearScope scratch_scope(scratch);
+
+  HashTable<BinaryLocator, kFlagPathStrings> string_pool;
+  HashTableInit(&string_pool, heap);
 
   ScanCacheWriter writer;
   ScanCacheWriterInit(&writer, heap);
@@ -449,10 +470,11 @@ bool ScanCacheSave(ScanCache* self, const char* fn, MemAllocHeap* heap)
   auto key_dynamic = [=](size_t index) -> const HashDigest* { return &dyn_records[index]->m_Key; };
   auto key_frozen = [=](size_t index) { return frozen_digests + index; };
 
-  auto save_dynamic = [&writer, dyn_records, now](size_t index)
+  auto save_dynamic = [&writer, dyn_records, now, &string_pool](size_t index)
   {
     SaveRecord(
         &writer,
+        &string_pool,
         &dyn_records[index]->m_Key,
         dyn_records[index]->m_Includes,
         dyn_records[index]->m_IncludeCount,
@@ -470,6 +492,7 @@ bool ScanCacheSave(ScanCache* self, const char* fn, MemAllocHeap* heap)
     {
       SaveRecord(
           &writer,
+          &string_pool,
           frozen_digests + index, 
           frozen_entries[index].m_IncludedFiles.GetArray(),
           frozen_entries[index].m_IncludedFiles.GetCount(),
@@ -485,6 +508,8 @@ bool ScanCacheSave(ScanCache* self, const char* fn, MemAllocHeap* heap)
   bool result = ScanCacheWriterFlush(&writer, fn);
 
   ScanCacheWriterDestroy(&writer);
+
+  HashTableDestroy(&string_pool);
 
   return result;
 }

@@ -39,23 +39,31 @@ namespace t2
     FrozenArray<FrozenDigestRecord> m_Records;
   };
 
+  struct DigestCacheRecord
+  {
+    HashDigest m_ContentDigest;
+    uint64_t   m_Timestamp;
+    uint64_t   m_AccessTime;
+  };
+
+
   struct DigestCache
   {
     ReadWriteLock           m_Lock;
     const DigestCacheState* m_State;
-    const char*             m_StateFilename;
     MemAllocHeap            m_Heap;
     MemAllocLinear          m_Allocator;
     MemoryMappedFile        m_StateFile;
-    HashTable               m_Table;
+    HashTable<DigestCacheRecord, kFlagPathStrings> m_Table;
     uint64_t                m_AccessTime;
   };
 
-  void DigestCacheInit(DigestCache* self, size_t heap_size, const char* filename);
+  void DigestCacheInit(DigestCache* self, size_t heap_size);
+  void DigestCacheOpen(DigestCache* self, const char* filename);
 
   void DigestCacheDestroy(DigestCache* self);
 
-  bool DigestCacheSave(DigestCache* self, MemAllocHeap* serialization_heap, const char* tmp_filename);
+  bool DigestCacheSave(DigestCache* self, MemAllocHeap* serialization_heap, const char* filename, const char* tmp_filename);
 
   bool DigestCacheGet(DigestCache* self, const char* filename, uint32_t hash, uint64_t timestamp, HashDigest* digest_out);
 

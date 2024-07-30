@@ -4,6 +4,7 @@ local native  = require "tundra.native"
 local nodegen = require "tundra.nodegen"
 local path    = require "tundra.path"
 local util    = require "tundra.util"
+local ide_com = require "tundra.ide.ide-common"
 
 LF = '\r\n'
 local UTF_HEADER = '\239\187\191' -- byte mark EF BB BF 
@@ -15,46 +16,13 @@ local HOOKS          = {}
 local msvc_generator = {}
 msvc_generator.__index = msvc_generator
 
-local project_types = util.make_lookup_table {
-  "Program", "SharedLibrary", "StaticLibrary", "CSharpExe", "CSharpLib", "ObjGroup",
-}
+local project_types = ide_com.project_types
+local binary_extension = ide_com.binary_extension
+local header_exts = ide_com.header_exts
 
 local toplevel_stuff = util.make_lookup_table {
   ".exe", ".lib", ".dll",
 }
-
-local binary_extension = util.make_lookup_table {
-  ".exe", ".lib", ".dll", ".pdb", ".res", ".obj", ".o", ".a",
-}
-
-local header_exts = util.make_lookup_table {
-  ".h", ".hpp", ".hh", ".inl",
-}
-
--- Scan for sources, following dependencies until those dependencies seem to be
--- a different top-level unit
-local function get_sources(dag, sources, generated, level, dag_lut)
-  for _, output in util.nil_ipairs(dag.outputs) do
-    local ext = path.get_extension(output)
-    if not binary_extension[ext] then
-      generated[output] = true
-      sources[output] = true -- pick up generated headers
-    end
-  end
-
-  for _, input in util.nil_ipairs(dag.inputs) do
-    local ext = path.get_extension(input)
-    if not binary_extension[ext] then
-      sources[input] = true
-    end
-  end
-
-  for _, dep in util.nil_ipairs(dag.deps) do
-    if not dag_lut[dep] then -- don't go into other top-level DAGs
-      get_sources(dep, sources, generated, level + 1, dag_lut)
-    end
-  end
-end
 
 function get_guid_string(data)
   local sha1 = native.digest_guid(data)
@@ -63,55 +31,11 @@ function get_guid_string(data)
   return guid:upper()
 end
 
-local function get_headers(unit, source_lut, dag_lut, name_to_dags)
-  local src_dir = ''
-
-  if not unit.Decl then
-    -- Ignore ExternalLibrary and similar that have no data.
-    return
-  end
-
-  if unit.Decl.SourceDir then
-    src_dir = unit.Decl.SourceDir .. '/'
-  end
-  for _, src in util.nil_ipairs(nodegen.flatten_list('*-*-*-*', unit.Decl.Sources)) do
-    if type(src) == "string" then
-      local ext = path.get_extension(src)
-      if header_exts[ext] then
-        local full_path = path.normalize(src_dir .. src)
-        source_lut[full_path] = true
-      end
-    end
-  end
-
-  local function toplevel(u)
-    if type(u) == "string" then
-      return type(name_to_dags[u]) ~= "nil"
-    end
-
-    for _, dag in pairs(u.Decl.__DagNodes) do
-      if dag_lut[dag] then
-        return true
-      end
-    end
-    return false
-  end
-
-  -- Repeat for dependencies ObjGroups
-  for _, dep in util.nil_ipairs(nodegen.flatten_list('*-*-*-*', unit.Decl.Depends)) do
-
-    if not toplevel(dep) then
-      get_headers(dep, source_lut, dag_lut)
-    end
-  end
-end
-
 local function make_meta_project(base_dir, data)
   data.Guid               = get_guid_string(data.Name)
   data.IdeGenerationHints = { Msvc = { SolutionFolder = "Build System Meta" } }
   data.IsMeta             = true
-  data.RelativeFilename   = data.Name .. ".vcxproj"
-  data.Filename           = base_dir .. data.RelativeFilename
+  data.Filename           = path.join(base_dir, data.Name .. ".vcxproj")
   data.Type               = "meta"
   if not data.Sources then
     data.Sources            = {}
@@ -122,10 +46,6 @@ end
 local function tundra_cmdline(args)
   local root_dir    = native.getcwd()
   return "\"" .. TundraExePath .. "\" -C \"" .. root_dir .. "\" " .. args
-end
-
-local function project_regen_commandline(ide_script)
-  return tundra_cmdline("-g " .. ide_script)
 end
 
 local function make_project_data(units_raw, env, proj_extension, hints, ide_script)
@@ -165,8 +85,7 @@ local function make_project_data(units_raw, env, proj_extension, hints, ide_scri
       project_by_name[name] = {
         Name             = name,
         Sources          = {},
-        RelativeFilename = relative_fn,
-        Filename         = base_dir .. relative_fn,
+        Filename         = path.join(base_dir, relative_fn),
         Guid             = get_guid_string(name),
         BuildByDefault   = hints.BuildAllByDefault,
       }
@@ -204,6 +123,9 @@ local function make_project_data(units_raw, env, proj_extension, hints, ide_scri
   -- Keep track of what source files have already been grabbed by other projects.
   local grabbed_sources = {}
 
+  -- Keep track of which projects mapped to what output name.
+  local project_map = {}
+
   for _, unit in ipairs(units) do
     local decl = unit.Decl
     local name = decl.Name
@@ -211,30 +133,41 @@ local function make_project_data(units_raw, env, proj_extension, hints, ide_scri
     local source_lut = {}
     local generated_lut = {}
     for build_id, dag_node in pairs(decl.__DagNodes) do
-      get_sources(dag_node, source_lut, generated_lut, 0, dag_node_lut)
+      ide_com.get_sources(dag_node, source_lut, generated_lut, 0, dag_node_lut)
     end
 
     -- Explicitly add all header files too as they are not picked up from the DAG
     -- Also pick up headers from non-toplevel DAGs we're depending on
-    get_headers(unit, source_lut, dag_node_lut, name_to_dags)
+    ide_com.get_headers(unit, source_lut, dag_node_lut, name_to_dags)
 
     -- Figure out which project should get this data.
+    local filterRoot
     local output_name = name
     local ide_hints = unit.Decl.IdeGenerationHints
     if ide_hints then
       if ide_hints.OutputProject then
         output_name = ide_hints.OutputProject
       end
+      if ide_hints.Msvc and ide_hints.Msvc.FilterRoot then
+        filterRoot = ide_hints.Msvc.FilterRoot
+      end
     end
 
     local proj = get_output_project(output_name)
 
-    if output_name == name then
-      -- This unit is the real thing for this project, not something that's
-      -- just being merged into it (like an ObjGroup). Set some more attributes.
-      proj.IdeGenerationHints = ide_hints
-      proj.DagNodes           = decl.__DagNodes
-      proj.Unit               = unit
+    -- Remember unit -> output_name relationship
+    if not project_map[output_name] then
+      project_map[output_name] = {}
+    end
+    plist = project_map[output_name]
+    plist[#plist + 1] = unit
+
+    -- Merge filter roots if available
+    if filterRoot then
+      if not proj.FilterRoots then
+        proj.FilterRoots = {}
+      end
+      proj.FilterRoots[#proj.FilterRoots + 1] = filterRoot
     end
 
     for src, _ in pairs(source_lut) do
@@ -250,6 +183,19 @@ local function make_project_data(units_raw, env, proj_extension, hints, ide_scri
     end
   end
 
+  -- Set additional attributes on unique projects
+  for output_name, plist in pairs(project_map) do
+    -- This unit is the real thing for this project, not something that's
+    -- just being merged into it (like an ObjGroup). Set some more attributes.
+    local proj = get_output_project(output_name)
+    local unit = plist[1]
+    proj.IdeGenerationHints = unit.Decl.IdeGenerationHints
+    if #plist == 1 then
+      proj.DagNodes = unit.Decl.__DagNodes
+      proj.Unit     = unit
+    end
+  end
+
   -- Get all accessed Lua files
   local accessed_lua_files = util.table_keys(get_accessed_files())
 
@@ -262,6 +208,10 @@ local function make_project_data(units_raw, env, proj_extension, hints, ide_scri
   end
   local source_list = util.map(util.filter(accessed_lua_files, is_non_tundra_lua_file), make_src_node)
 
+  if native.stat_file('.editorconfig').exists then
+    source_list[#source_list + 1] = make_src_node('.editorconfig')
+  end
+
   local solution_hints = hints.MsvcSolutions
   if not solution_hints then
     print("No IdeGenerationHints.MsvcSolutions specified - using defaults")
@@ -270,19 +220,16 @@ local function make_project_data(units_raw, env, proj_extension, hints, ide_scri
     }
   end
 
+  local meta_dir = base_dir
+  if hints.MsvcMetaProjectsDir then
+    meta_dir = hints.MsvcMetaProjectsDir
+    native.mkdir(meta_dir)
+  end
+
   local projects = util.table_values(project_by_name)
   local vanilla_projects = util.clone_array(projects)
 
   local solutions = {}
-
-  -- Create meta project to regenerate solutions/projects. Added to every solution.
-  local regen_meta_proj = make_meta_project(base_dir, {
-    Name               = "00-Regenerate-Projects",
-    FriendlyName       = "Regenerate Solutions and Projects",
-    BuildCommand       = project_regen_commandline(ide_script),
-  })
-
-  projects[#projects + 1] = regen_meta_proj
 
   for name, data in pairs(solution_hints) do
     local sln_projects
@@ -305,16 +252,27 @@ local function make_project_data(units_raw, env, proj_extension, hints, ide_scri
       ext_projects[#ext_projects + 1] = ext
     end
 
-    local meta_proj = make_meta_project(base_dir, {
-      Name               = "00-tundra-" .. path.drop_suffix(name),
+    -- Create meta project to regenerate solutions/projects.
+    local regen_meta_proj = make_meta_project(meta_dir, {
+      Name               = "00-tundra-idegen-" .. path.drop_suffix(name),
+      FriendlyName       = "Regenerate Solutions and Projects",
+      BuildCommand       = ide_com.project_regen_commandline(ide_script),
+      Env                = env,
+    })
+    
+    -- Create meta project to build solution
+    local meta_proj = make_meta_project(meta_dir, {
+      Name               = "00-tundra-build-" .. path.drop_suffix(name),
       FriendlyName       = "Build This Solution",
       BuildByDefault     = true,
       Sources            = source_list,
-      BuildProjects      = util.clone_array(sln_projects),
+      BuildProjects      = {}, -- util.clone_array(sln_projects),
+      Env                = env,
     })
 
     sln_projects[#sln_projects + 1] = regen_meta_proj
     sln_projects[#sln_projects + 1] = meta_proj
+    projects[#projects + 1] = regen_meta_proj
     projects[#projects + 1] = meta_proj
 
     solutions[#solutions + 1] = {
@@ -333,29 +291,8 @@ local cl_tags = {
   ['.hh']  = 'ClInclude',
   ['.hpp'] = 'ClInclude',
   ['.inl'] = 'ClInclude',
+  ['.natvis'] = 'Natvis',
 }
-
-local function slurp_file(fn)
-  local fh, err = io.open(fn, 'rb')
-  if fh then
-    local data = fh:read("*all")
-    fh:close()
-    return data
-  end
-  return ''
-end
-
-local function replace_if_changed(new_fn, old_fn)
-  local old_data = slurp_file(old_fn)
-  local new_data = slurp_file(new_fn)
-  if old_data == new_data then
-    os.remove(new_fn)
-    return
-  end
-  printf("Updating %s", old_fn)
-  os.remove(old_fn)
-  os.rename(new_fn, old_fn)
-end
 
 function msvc_generator:generate_solution(fn, projects, ext_projects, solution)
   local sln = io.open(fn .. '.tmp', 'wb')
@@ -374,10 +311,14 @@ function msvc_generator:generate_solution(fn, projects, ext_projects, solution)
     end
   end
 
+  local solution_dir = path.get_filename_dir(fn)
   for _, proj in ipairs(projects) do
     local name = proj.Name
-    local fname = proj.RelativeFilename
+    local fname = proj.Filename
     local guid = proj.Guid
+    if fname:find(solution_dir, 1, true) then
+      fname = fname:sub(#solution_dir + 2)
+    end
     sln:write(string.format('Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "%s", "%s", "{%s}"', name, fname, guid), LF)
     sln:write('EndProject', LF)
   end
@@ -450,21 +391,7 @@ function msvc_generator:generate_solution(fn, projects, ext_projects, solution)
   sln:write("EndGlobal", LF)
   sln:close()
 
-  replace_if_changed(fn .. ".tmp", fn)
-end
-
-local function find_dag_node_for_config(project, tuple)
-  local build_id = string.format("%s-%s-%s", tuple.Config.Name, tuple.Variant.Name, tuple.SubVariant)
-  local nodes = project.DagNodes
-  if not nodes then
-    return nil
-  end
-
-  if nodes[build_id] then
-    return nodes[build_id]
-  end
-  errorf("couldn't find config %s for project %s (%d dag nodes) - available: %s",
-    build_id, project.Name, #nodes, table.concat(util.table_keys(nodes), ", "))
+  ide_com.replace_if_changed(fn .. ".tmp", fn)
 end
 
 function msvc_generator:generate_project(project, all_projects)
@@ -475,9 +402,12 @@ function msvc_generator:generate_project(project, all_projects)
   p:write(' DefaultTargets="Build"')
 
   -- This doesn't seem to change any behaviour, but this is the default
-  -- value when creating a makefile project from VS2013 and VS2015
+  -- value when creating a makefile project from VS2013, VS2015, VS2017
   -- wizards.
-  if VERSION_YEAR == '2015' then
+  -- MS state that ToolsVersion is obsolete from VS2019 onwards.
+  if VERSION_YEAR == '2017' then
+    p:write(' ToolsVersion="15.0"')
+  elseif VERSION_YEAR == '2015' then
     p:write(' ToolsVersion="14.0"')
   elseif VERSION_YEAR == '2013' then
     p:write(' ToolsVersion="12.0"')
@@ -499,8 +429,16 @@ function msvc_generator:generate_project(project, all_projects)
   p:write('\t</ItemGroup>', LF)
 
   p:write('\t<PropertyGroup Label="Globals">', LF)
+  -- Undocumented, appears to only exist in VS2017 projects.
+  if VERSION_YEAR == '2017' then
+    p:write('\t\t<VCProjectVersion>15.0</VCProjectVersion>', LF)
+  end
   p:write('\t\t<ProjectGuid>{', project.Guid, '}</ProjectGuid>', LF)
-  p:write('\t\t<Keyword>MakeFileProj</Keyword>', LF)
+  if VERSION_YEAR == '2022' or VERSION_YEAR == '2019' or VERSION_YEAR == '2017' then
+    p:write('\t\t<Keyword>Win32Proj</Keyword>', LF)
+  else
+    p:write('\t\t<Keyword>MakefileProj</Keyword>', LF)
+  end
   if project.FriendlyName then
     p:write('\t\t<ProjectName>', project.FriendlyName, '</ProjectName>', LF)
   end
@@ -510,11 +448,11 @@ function msvc_generator:generate_project(project, all_projects)
   end
 
   p:write('\t</PropertyGroup>', LF)
-  p:write('\t<PropertyGroup>', LF)
   if VERSION_YEAR == '2012' then
+    p:write('\t<PropertyGroup>', LF)
     p:write('\t\t<_ProjectFileVersion>10.0.30319.1</_ProjectFileVersion>', LF)
+    p:write('\t</PropertyGroup>', LF)
   end
-  p:write('\t</PropertyGroup>', LF)
 
   p:write('\t<Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />', LF)
 
@@ -522,23 +460,37 @@ function msvc_generator:generate_project(project, all_projects)
   for _, tuple in ipairs(self.config_tuples) do
     p:write('\t<PropertyGroup Condition="\'$(Configuration)|$(Platform)\'==\'', tuple.MsvcName, '\'" Label="Configuration">', LF)
     p:write('\t\t<ConfigurationType>Makefile</ConfigurationType>', LF)
-    p:write('\t\t<UseDebugLibraries>true</UseDebugLibraries>', LF) -- I have no idea what this setting affects
+    p:write('\t\t<UseDebugLibraries>true</UseDebugLibraries>', LF) -- This seems to be a master switch for multiple debug features
     if VERSION_YEAR == '2012' then
-      p:write('\t\t<PlatformToolset>v110</PlatformToolset>', LF) -- I have no idea what this setting affects
+      p:write('\t\t<PlatformToolset>v110</PlatformToolset>', LF) -- Use MSVC compiler toolset version 11.0 (VS2012)
     elseif VERSION_YEAR == '2013' then
-      p:write('\t\t<PlatformToolset>v120</PlatformToolset>', LF) -- I have no idea what this setting affects
+      p:write('\t\t<PlatformToolset>v120</PlatformToolset>', LF) -- Use MSVC compiler toolset version 12.0 (VS2013)
     elseif VERSION_YEAR == '2015' then
-      p:write('\t\t<PlatformToolset>v140</PlatformToolset>', LF) -- I have no idea what this setting affects
+      p:write('\t\t<PlatformToolset>v140</PlatformToolset>', LF) -- Use MSVC compiler toolset version 14.0 (VS2015)
+    elseif VERSION_YEAR == '2017' then
+      p:write('\t\t<PlatformToolset>v141</PlatformToolset>', LF) -- Use MSVC compiler toolset version 14.1 (VS2017)
+    elseif VERSION_YEAR == '2019' then
+      p:write('\t\t<PlatformToolset>v142</PlatformToolset>', LF) -- Use MSVC compiler toolset version 14.2 (VS2019)
+    elseif VERSION_YEAR == '2022' then
+      p:write('\t\t<PlatformToolset>v143</PlatformToolset>', LF) -- Use MSVC compiler toolset version 14.3 (VS2022)
     end
     p:write('\t</PropertyGroup>', LF)
   end
 
   p:write('\t<Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />', LF)
 
+  if VERSION_YEAR == '2022' or VERSION_YEAR == '2019' or VERSION_YEAR == '2017' then
+    for _, tuple in ipairs(self.config_tuples) do
+      p:write('\t<ImportGroup Label="PropertySheets" Condition="\'$(Configuration)|$(Platform)\'==\'', tuple.MsvcName, '\'">', LF)
+      p:write('\t\t<Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists(\'$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props\')" Label="LocalAppDataPlatform" />', LF)
+      p:write('\t</ImportGroup>', LF)
+    end
+  end
+
   for _, tuple in ipairs(self.config_tuples) do
     p:write('\t<PropertyGroup Condition="\'$(Configuration)|$(Platform)\'==\'', tuple.MsvcName, '\'">', LF)
 
-    local dag_node = find_dag_node_for_config(project, tuple)
+    local dag_node = ide_com.find_dag_node_for_config(project, tuple)
     local include_paths, defines
     if dag_node then
       local env = dag_node.src_env
@@ -567,17 +519,28 @@ function msvc_generator:generate_project(project, all_projects)
     local clean_cmd   = base .. "--clean " .. build_id
     local rebuild_cmd = base .. "--rebuild " .. build_id
 
+    -- This is needed in the case where a project maps to a different name using OutputProject
+    local function get_project_actual_name(proj)
+      if proj.Unit and proj.Unit.Decl then
+        return proj.Unit.Decl.Name
+      else
+        return proj.Name
+      end
+    end
+
+    project_name = get_project_actual_name(project)
+
     if project.BuildCommand then
       build_cmd = project.BuildCommand
       clean_cmd = ""
       rebuild_cmd = ""
     elseif not project.IsMeta then
-      build_cmd   = build_cmd .. " " .. project.Name
-      clean_cmd   = clean_cmd .. " " .. project.Name
-      rebuild_cmd = rebuild_cmd .. " " .. project.Name
+      build_cmd   = build_cmd .. " " .. project_name
+      clean_cmd   = clean_cmd .. " " .. project_name
+      rebuild_cmd = rebuild_cmd .. " " .. project_name
     else
       local all_projs_str = table.concat(
-        util.map(assert(project.BuildProjects), function (p) return p.Name end), ' ')
+        util.map(assert(project.BuildProjects), function (p) return get_project_actual_name(p) end), ' ')
       build_cmd   = build_cmd .. " " .. all_projs_str
       clean_cmd   = clean_cmd .. " " .. all_projs_str
       rebuild_cmd = rebuild_cmd .. " " .. all_projs_str
@@ -590,9 +553,26 @@ function msvc_generator:generate_project(project, all_projects)
     p:write('\t\t<NMakePreprocessorDefinitions>', defines, ';$(NMakePreprocessorDefinitions)</NMakePreprocessorDefinitions>', LF)
     p:write('\t\t<NMakeIncludeSearchPath>', include_paths, ';$(NMakeIncludeSearchPath)</NMakeIncludeSearchPath>', LF)
     p:write('\t\t<NMakeForcedIncludes>$(NMakeForcedIncludes)</NMakeForcedIncludes>', LF)
+    local env
+    if dag_node then
+      env = dag_node.src_env
+    else
+      env = project.Env
+    end
+    local out_dir = path.join(env:interpolate('$(OBJECTROOT)'), build_id)
+    p:write('\t\t<OutDir>', out_dir, '</OutDir>', LF)
+    p:write('\t\t<IntDir>$(OutDir)\\__', project_name, '</IntDir>', LF)
     p:write('\t</PropertyGroup>', LF)
   end
 
+  for _, tuple in ipairs(self.config_tuples) do
+    p:write('\t<ItemDefinitionGroup Condition="\'$(Configuration)|$(Platform)\'==\'', tuple.MsvcName, '\'">', LF)
+    p:write('\t\t<BuildLog>', LF)
+    p:write('\t\t\t<Path>$(IntDir)\\', project_name, '-vs.log</Path>', LF)
+    p:write('\t\t</BuildLog>', LF)
+    p:write('\t</ItemDefinitionGroup>', LF)
+  end
+  
   if HOOKS.pre_sources then
     HOOKS.pre_sources(p, project)
   end
@@ -626,7 +606,7 @@ function msvc_generator:generate_project(project, all_projects)
   p:write('</Project>', LF)
   p:close()
 
-  replace_if_changed(fn .. ".tmp", fn)
+  ide_com.replace_if_changed(fn .. ".tmp", fn)
 end
 
 local function get_common_dir(sources)
@@ -676,6 +656,11 @@ function msvc_generator:generate_project_filters(project)
   local filters = {}
   local sources = {}
 
+  local filterRoots = {}
+  if project.FilterRoots then
+    filterRoots = project.FilterRoots
+  end
+
   -- Mangle source filenames, and find which filters need to be created
   for _, record in ipairs(project.Sources) do
     local fn = record.Path
@@ -697,6 +682,15 @@ function msvc_generator:generate_project_filters(project)
 
     if record.Generated then
       dir = 'Generated Files'
+    end
+
+    if filterRoots then
+      for _,filterRoot in pairs(filterRoots) do
+        if dir:find(filterRoot, 1, true) then
+          dir = dir:sub(#filterRoot + 2)
+          break
+        end
+      end
     end
 
     sources[#sources + 1] = {
@@ -742,7 +736,7 @@ function msvc_generator:generate_project_filters(project)
 
   p:close()
 
-  replace_if_changed(fn .. ".tmp", fn)
+  ide_com.replace_if_changed(fn .. ".tmp", fn)
 end
 
 function msvc_generator:generate_project_user(project)
@@ -764,7 +758,7 @@ function msvc_generator:generate_project_user(project)
   p:write('>', LF)
 
   for _, tuple in ipairs(self.config_tuples) do
-    local dag_node = find_dag_node_for_config(project, tuple)
+    local dag_node = ide_com.find_dag_node_for_config(project, tuple)
     if dag_node then
       local exe = nil
       for _, output in util.nil_ipairs(dag_node.outputs) do
@@ -774,8 +768,11 @@ function msvc_generator:generate_project_user(project)
         end
       end
       if exe then
+        if not path.is_absolute(exe) then
+          exe = path.join(native.getcwd(), exe)
+        end
         p:write('\t<PropertyGroup Condition="\'$(Configuration)|$(Platform)\'==\'', tuple.MsvcName, '\'">', LF)
-        p:write('\t\t<LocalDebuggerCommand>', native.getcwd() .. '\\' .. exe, '</LocalDebuggerCommand>', LF)
+        p:write('\t\t<LocalDebuggerCommand>', exe, '</LocalDebuggerCommand>', LF)
         p:write('\t\t<DebuggerFlavor>WindowsLocalDebugger</DebuggerFlavor>', LF)
         p:write('\t\t<LocalDebuggerWorkingDirectory>', native.getcwd(), '</LocalDebuggerWorkingDirectory>', LF)
         p:write('\t</PropertyGroup>', LF)

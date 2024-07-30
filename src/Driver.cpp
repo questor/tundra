@@ -15,6 +15,9 @@
 #include "Stats.hpp"
 #include "TargetSelect.hpp"
 #include "HashTable.hpp"
+#include "Hash.hpp"
+#include "Profiler.hpp"
+#include "FileSign.hpp"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -38,18 +41,16 @@ namespace t2
 
 TundraStats g_Stats;
 
-static const char s_BuildFile[]              = "tundra.lua";
-static const char s_DagFileName[]            = ".tundra2.dag";
-static const char s_StateFileName[]          = ".tundra2.state";
-static const char s_ScanCacheFileName[]      = ".tundra2.scancache";
-static const char s_DigestCacheFileName[]    = ".tundra2.digestcache";
-// Temporary filenames where we write data first. These are then renamed to commit.
-static const char s_StateFileNameTmp[]       = ".tundra2.state.tmp";
-static const char s_ScanCacheFileNameTmp[]   = ".tundra2.scancache.tmp";
-static const char s_DigestCacheFileNameTmp[] = ".tundra2.digestcache.tmp";
+static const char* s_BuildFile;
+static const char* s_DagFileName;
 
 static bool DriverPrepareDag(Driver* self, const char* dag_fn);
 static bool DriverCheckDagSignatures(Driver* self);
+void DriverInitializeTundraFilePaths(DriverOptions* driverOptions)
+{
+    s_BuildFile               = "tundra.lua";
+    s_DagFileName             = driverOptions->m_DAGFileName;
+}
 
 // Set default options.
 void DriverOptionsInit(DriverOptions* self)
@@ -64,14 +65,17 @@ void DriverOptionsInit(DriverOptions* self)
   self->m_DisplayStats    = false;
   self->m_GenDagOnly      = false;
   self->m_Quiet           = false;
+  self->m_IdeGen          = false;
   self->m_Clean           = false;
   self->m_Rebuild         = false;
-  self->m_IdeGen          = false;
   self->m_DebugSigning    = false;
   self->m_ContinueOnError = false;
+  self->m_QuickstartGen   = false;
   self->m_ThreadCount     = GetCpuCount();
   self->m_WorkingDir      = nullptr;
-  #if defined(TUNDRA_WIN32)
+  self->m_DAGFileName     = ".tundra2.dag";
+  self->m_ProfileOutput   = nullptr;
+#if defined(TUNDRA_WIN32)
   self->m_RunUnprotected  = false;
 #endif
 }
@@ -164,12 +168,18 @@ void DriverShowTargets(Driver* self)
 
 bool DriverInitData(Driver* self)
 {
+  ProfilerScope prof_scope("Tundra InitData", 0);
+
+  DigestCacheInit(&self->m_DigestCache, MB(128));
+
   if (!DriverPrepareDag(self, s_DagFileName))
     return false;
 
-  LoadFrozenData<StateData>(s_StateFileName, &self->m_StateFile, &self->m_StateData);
+  DigestCacheOpen(&self->m_DigestCache, self->m_DagData->m_DigestCacheFileName);
 
-  LoadFrozenData<ScanData>(s_ScanCacheFileName, &self->m_ScanFile, &self->m_ScanData);
+  LoadFrozenData<StateData>(self->m_DagData->m_StateFileName, &self->m_StateFile, &self->m_StateData);
+
+  LoadFrozenData<ScanData>(self->m_DagData->m_ScanCacheFileName, &self->m_ScanFile, &self->m_ScanData);
 
   ScanCacheSetCache(&self->m_ScanCache, self->m_ScanData);
 
@@ -243,84 +253,12 @@ static bool DriverCheckDagSignatures(Driver* self)
     }
   }
 
-  // Helper for directory iteration + memory allocation of strings.  We need to
-  // buffer the filenames as we need them in sorted order to ensure the results
-  // are consistent between runs.
-  struct IterContext
-  {
-    MemAllocLinear       *m_Allocator;
-    MemAllocHeap         *m_Heap;
-    Buffer<const char *>  m_Dirs;
-    Buffer<const char *>  m_Files;
-
-    void Init(MemAllocHeap* heap, MemAllocLinear* linear)
-    {
-      m_Allocator = linear;
-      m_Heap      = heap;
-      BufferInit(&m_Dirs);
-      BufferInit(&m_Files);
-    }
-
-    void Destroy()
-    {
-      BufferDestroy(&m_Files, m_Heap);
-      BufferDestroy(&m_Dirs, m_Heap);
-    }
-
-    static void Callback(void* user_data, const FileInfo& info, const char* path)
-    {
-      IterContext* self = (IterContext*) user_data;
-      char* data = StrDup(self->m_Allocator, path);
-      Buffer<const char*>* target = info.IsDirectory() ? &self->m_Dirs : &self->m_Files;
-      BufferAppendOne(target, self->m_Heap, data);
-    }
-    
-    static int SortStringPtrs(const void* l, const void* r)
-    {
-      return strcmp(*(const char**)l, *(const char**)r);
-    }
-  };
-
   // Check directory listing fingerprints
   // Note that the digest computation in here must match the one in LuaListDirectory
   // The digests computed there are stored in the signature block by Lua code.
   for (const DagGlobSignature& sig : dag_data->m_GlobSignatures)
   {
-    const char* path = sig.m_Path;
-
-    // Set up to rewind allocator for each loop iteration
-    MemAllocLinearScope mem_scope(&self->m_Allocator);
-
-    // Set up context
-    IterContext ctx;
-    ctx.Init(&self->m_Heap, &self->m_Allocator);
-
-    // Get directory data
-    ListDirectory(path, &ctx, IterContext::Callback);
-
-    // Sort data
-    qsort(ctx.m_Dirs.m_Storage, ctx.m_Dirs.m_Size, sizeof(const char*), IterContext::SortStringPtrs);
-    qsort(ctx.m_Files.m_Storage, ctx.m_Files.m_Size, sizeof(const char*), IterContext::SortStringPtrs);
-
-    // Compute digest
-    HashState h;
-    HashInit(&h);
-    for (const char* p : ctx.m_Dirs)
-    {
-      HashAddString(&h, p);
-      HashAddSeparator(&h);
-    }
-
-    for (const char* p : ctx.m_Files)
-    {
-      HashAddString(&h, p);
-      HashAddSeparator(&h);
-    }
-
-    HashDigest digest;
-    HashFinalize(&h, &digest);
-
-    ctx.Destroy();
+    HashDigest digest = CalculateGlobSignatureFor(sig.m_Path, &self->m_Heap, &self->m_Allocator);
 
     // Compare digest with the one stored in the signature block
     if (0 != memcmp(&digest, &sig.m_Digest, sizeof digest))
@@ -454,7 +392,7 @@ static void FindNodesByName(
 
           for (const FrozenFileAndHash& input : node->m_InputFiles)
           {
-            if (filename_hash == input.m_Hash && 0 == PathCompare(input.m_Filename, filename))
+            if (filename_hash == input.m_FilenameHash && 0 == PathCompare(input.m_Filename, filename))
             {
               BufferAppendOne(out_nodes, heap, node_index);
               Log(kDebug, "mapped %s to node %d (based on input file)", name, node_index);
@@ -468,7 +406,7 @@ static void FindNodesByName(
 
           for (const FrozenFileAndHash& output : node->m_OutputFiles)
           {
-            if (filename_hash == output.m_Hash && 0 == PathCompare(output.m_Filename, filename))
+            if (filename_hash == output.m_FilenameHash && 0 == PathCompare(output.m_Filename, filename))
             {
               BufferAppendOne(out_nodes, heap, node_index);
               Log(kDebug, "mapped %s to node %d (based on output file)", name, node_index);
@@ -486,7 +424,7 @@ static void FindNodesByName(
     }
 
     if (!found)
-    { 
+    {
       Log(kWarning, "unable to map %s to any named node or input/output file", name);
     }
   }
@@ -548,6 +486,8 @@ static void DriverSelectNodes(const DagData* dag, const char** targets, int targ
 
 bool DriverPrepareNodes(Driver* self, const char** targets, int target_count)
 {
+  ProfilerScope prof_scope("Tundra PrepareNodes", 0);
+
   const DagData    *dag       = self->m_DagData;
   const NodeData   *src_nodes = dag->m_NodeData;
   const HashDigest *src_guids = dag->m_NodeGuids;
@@ -647,7 +587,7 @@ bool DriverPrepareNodes(Driver* self, const char** targets, int target_count)
     node_remap[global_index] = local_index;
   }
 
-  Log(kDebug, "Node remap: %d src nodes, %d active nodes, using %d bytes of node state buffer space", 
+  Log(kDebug, "Node remap: %d src nodes, %d active nodes, using %d bytes of node state buffer space",
       dag->m_NodeCount, node_count, sizeof(NodeState) * node_count);
 
   BufferDestroy(&node_stack, &self->m_Heap);
@@ -658,7 +598,7 @@ bool DriverPrepareNodes(Driver* self, const char** targets, int target_count)
 
 bool DriverInit(Driver* self, const DriverOptions* options)
 {
-  HeapInit(&self->m_Heap, 128 * 1024 * 1024, HeapFlags::kThreadSafe);
+  HeapInit(&self->m_Heap);
   LinearAllocInit(&self->m_Allocator, &self->m_Heap, MB(64), "Driver Linear Allocator");
 
   LinearAllocSetOwner(&self->m_Allocator, ThreadCurrent());
@@ -680,19 +620,11 @@ bool DriverInit(Driver* self, const DriverOptions* options)
   LinearAllocInit(&self->m_ScanCacheAllocator, &self->m_Heap, MB(64), "scan cache");
   ScanCacheInit(&self->m_ScanCache, &self->m_Heap, &self->m_ScanCacheAllocator);
 
-#if defined(TUNDRA_WIN32) || defined(TUNDRA_APPLE)
-  const uint32_t stat_cache_flags = 0;
-#else
-  const uint32_t stat_cache_flags = StatCache::kFlagCaseSensitive;
-#endif
-
   // This linear allocator is only accessed when the state cache is locked.
   LinearAllocInit(&self->m_StatCacheAllocator, &self->m_Heap, MB(64), "stat cache");
-  StatCacheInit(&self->m_StatCache, &self->m_StatCacheAllocator, &self->m_Heap, stat_cache_flags);
+  StatCacheInit(&self->m_StatCache, &self->m_StatCacheAllocator, &self->m_Heap);
 
   memset(&self->m_PassNodeCount, 0, sizeof self->m_PassNodeCount);
-
-  DigestCacheInit(&self->m_DigestCache, MB(128), s_DigestCacheFileName);
 
   return true;
 }
@@ -730,6 +662,7 @@ BuildResult::Enum DriverBuild(Driver* self)
   // Do some paranoia checking of the node state to make sure pass indices are
   // set up correctly.
   {
+    ProfilerScope prof_scope("Tundra DebugCheckPassIndices", 0);
     int i = 0;
     for (int pass = 0; pass < pass_count; ++pass)
     {
@@ -796,14 +729,17 @@ BuildResult::Enum DriverBuild(Driver* self)
   }
 
 #if ENABLED(CHECKED_BUILD)
-  // Paranoia - double check node remapping table
-  for (size_t i = 0, count = self->m_Nodes.m_Size; i < count; ++i)
   {
-    const NodeState* state = self->m_Nodes.m_Storage + i;
-    const NodeData* src = state->m_MmapData;
-    const int src_index = int(src - self->m_DagData->m_NodeData);
-    int remapped_index = self->m_NodeRemap[src_index];
-    CHECK(size_t(remapped_index) == i);
+    ProfilerScope prof_scope("Tundra DebugCheckRemap", 0);
+    // Paranoia - double check node remapping table
+    for (size_t i = 0, count = self->m_Nodes.m_Size; i < count; ++i)
+    {
+      const NodeState* state = self->m_Nodes.m_Storage + i;
+      const NodeData* src = state->m_MmapData;
+      const int src_index = int(src - self->m_DagData->m_NodeData);
+      int remapped_index = self->m_NodeRemap[src_index];
+      CHECK(size_t(remapped_index) == i);
+    }
   }
 #endif
 
@@ -812,7 +748,7 @@ BuildResult::Enum DriverBuild(Driver* self)
   BuildQueueInit(&build_queue, &queue_config);
 
   int global_node_index = 0;
-  
+
   BuildResult::Enum build_result = BuildResult::kOk;
 
   for (int pass = 0; BuildResult::kOk == build_result && pass < pass_count; ++pass)
@@ -853,18 +789,18 @@ bool DriverSaveScanCache(Driver* self)
   // This will be invalidated.
   self->m_ScanData = nullptr;
 
-  bool success = ScanCacheSave(scan_cache, s_ScanCacheFileNameTmp, &self->m_Heap);
+  bool success = ScanCacheSave(scan_cache, self->m_DagData->m_ScanCacheFileNameTmp, &self->m_Heap);
 
   // Unmap the file so we can overwrite it (on Windows.)
   MmapFileDestroy(&self->m_ScanFile);
 
   if (success)
   {
-    success = RenameFile(s_ScanCacheFileNameTmp, s_ScanCacheFileName);
+    success = RenameFile(self->m_DagData->m_ScanCacheFileNameTmp, self->m_DagData->m_ScanCacheFileName);
   }
   else
   {
-    remove(s_ScanCacheFileNameTmp);
+    remove(self->m_DagData->m_ScanCacheFileNameTmp);
   }
 
   return success;
@@ -874,13 +810,14 @@ bool DriverSaveScanCache(Driver* self)
 bool DriverSaveDigestCache(Driver* self)
 {
   // This will be invalidated.
-  return DigestCacheSave(&self->m_DigestCache, &self->m_Heap, s_DigestCacheFileNameTmp);
+  return DigestCacheSave(&self->m_DigestCache, &self->m_Heap, self->m_DagData->m_DigestCacheFileName, self->m_DagData->m_DigestCacheFileNameTmp);
 }
 
 
 bool DriverSaveBuildState(Driver* self)
 {
   TimingScope timing_scope(nullptr, &g_Stats.m_StateSaveTimeCycles);
+  ProfilerScope prof_scope("Tundra SaveState", 0);
 
   MemAllocLinearScope alloc_scope(&self->m_Allocator);
 
@@ -1043,16 +980,16 @@ bool DriverSaveBuildState(Driver* self)
   MmapFileUnmap(&self->m_StateFile);
   self->m_StateData = nullptr;
 
-  bool success = BinaryWriterFlush(&writer, s_StateFileNameTmp);
+  bool success = BinaryWriterFlush(&writer, self->m_DagData->m_StateFileNameTmp);
 
   if (success)
   {
     // Commit atomically with a file rename.
-    success = RenameFile(s_StateFileNameTmp, s_StateFileName);
+    success = RenameFile(self->m_DagData->m_StateFileNameTmp, self->m_DagData->m_StateFileName);
   }
   else
   {
-    remove(s_StateFileNameTmp);
+    remove(self->m_DagData->m_StateFileNameTmp);
   }
 
   BinaryWriterDestroy(&writer);
@@ -1063,6 +1000,7 @@ bool DriverSaveBuildState(Driver* self)
 void DriverRemoveStaleOutputs(Driver* self)
 {
   TimingScope timing_scope(nullptr, &g_Stats.m_StaleCheckTimeCycles);
+  ProfilerScope prof_scope("Tundra RemoveStaleOutputs", 0);
 
   const DagData* dag = self->m_DagData;
   const StateData* state = self->m_StateData;
@@ -1076,21 +1014,17 @@ void DriverRemoveStaleOutputs(Driver* self)
     return;
   }
 
-  HashTable file_table;
-  HashTableInit(&file_table, &self->m_Heap, HashTable::kFlagPathStrings);
+  HashSet<kFlagPathStrings> file_table;
+  HashSetInit(&file_table, &self->m_Heap);
 
   // Insert all current regular and aux output files into the hash table.
-  auto add_file = [&file_table, scratch](const FrozenFileAndHash& p) -> void
+  auto add_file = [&file_table](const FrozenFileAndHash& p) -> void
   {
-    uint32_t    hash = p.m_Hash;
+    const uint32_t hash = p.m_FilenameHash;
 
-    if (nullptr == HashTableLookup(&file_table, hash, p.m_Filename))
+    if (!HashSetLookup(&file_table, hash, p.m_Filename))
     {
-      HashRecord* record = LinearAllocate<HashRecord>(scratch);
-      record->m_Hash   = hash;
-      record->m_String = p.m_Filename;
-      record->m_Next   = nullptr;
-      HashTableInsert(&file_table, record);
+      HashSetInsert(&file_table, hash, p.m_Filename);
     }
   };
 
@@ -1109,8 +1043,8 @@ void DriverRemoveStaleOutputs(Driver* self)
     }
   }
 
-  HashTable nuke_table;
-  HashTableInit(&nuke_table, &self->m_Heap, HashTable::kFlagPathStrings);
+  HashSet<kFlagPathStrings> nuke_table;
+  HashSetInit(&nuke_table, &self->m_Heap);
 
   // Check all output files in the state if they're still around.
   // Otherwise schedule them (and all their parent dirs) for nuking.
@@ -1119,15 +1053,11 @@ void DriverRemoveStaleOutputs(Driver* self)
   {
     uint32_t path_hash = Djb2HashPath(path);
 
-    if (nullptr == HashTableLookup(&file_table, path_hash, path))
+    if (!HashSetLookup(&file_table, path_hash, path))
     {
-      if (nullptr == HashTableLookup(&nuke_table, path_hash, path))
+      if (!HashSetLookup(&nuke_table, path_hash, path))
       {
-        HashRecord* record = LinearAllocate<HashRecord>(scratch);
-        record->m_Hash   = path_hash;
-        record->m_String = path;
-        record->m_Next   = nullptr;
-        HashTableInsert(&nuke_table, record);
+        HashSetInsert(&nuke_table, path_hash, path);
       }
 
       PathBuffer buffer;
@@ -1142,13 +1072,9 @@ void DriverRemoveStaleOutputs(Driver* self)
         PathFormat(dir, &buffer);
         uint32_t dir_hash = Djb2HashPath(dir);
 
-        if (nullptr == HashTableLookup(&nuke_table, dir_hash, dir))
+        if (!HashSetLookup(&nuke_table, dir_hash, dir))
         {
-          HashRecord* record = LinearAllocate<HashRecord>(scratch);
-          record->m_Hash   = dir_hash;
-          record->m_String = StrDup(scratch, dir);
-          record->m_Next   = nullptr;
-          HashTableInsert(&nuke_table, record);
+          HashSetInsert(&nuke_table, dir_hash, StrDup(scratch, dir));
         }
       }
     }
@@ -1172,8 +1098,8 @@ void DriverRemoveStaleOutputs(Driver* self)
   // Create list of files and dirs, sort descending by path length. This sorts
   // files and subdirectories before their parent directories.
   const char** paths = LinearAllocateArray<const char*>(scratch, nuke_table.m_RecordCount);
-  HashTableWalk(&nuke_table, [paths](uint32_t index, const HashRecord* record) {
-    paths[index] = record->m_String;
+  HashSetWalk(&nuke_table, [paths](uint32_t index, uint32_t hash, const char* str) {
+    paths[index] = str;
   });
 
   std::sort(paths, paths + nuke_table.m_RecordCount, [](const char* l, const char* r) {
@@ -1182,16 +1108,17 @@ void DriverRemoveStaleOutputs(Driver* self)
 
   for (uint32_t i = 0, nuke_count = nuke_table.m_RecordCount; i < nuke_count; ++i)
   {
-    Log(kDebug, "cleaning up %s", paths[i]); 
+    Log(kDebug, "cleaning up %s", paths[i]);
     RemoveFileOrDir(paths[i]);
   }
 
-  HashTableDestroy(&nuke_table);
-  HashTableDestroy(&file_table);
+  HashSetDestroy(&nuke_table);
+  HashSetDestroy(&file_table);
 }
 
 void DriverCleanOutputs(Driver* self)
 {
+  ProfilerScope prof_scope("Tundra Clean", 0);
   int count = 0;
   for (NodeState& state : self->m_Nodes)
   {

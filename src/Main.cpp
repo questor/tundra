@@ -4,6 +4,7 @@
 #include "Exec.hpp"
 #include "SignalHandler.hpp"
 #include "DagGenerator.hpp"
+#include "Profiler.hpp"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -65,8 +66,12 @@ static const struct OptionTemplate
     "Generate an extensive log of signature generation" },
   { 's', "stats", OptionType::kBool, offsetof(t2::DriverOptions, m_DisplayStats),
     "Display stats" },
+  { 'p', "profile", OptionType::kString, offsetof(t2::DriverOptions, m_ProfileOutput),
+    "Output build profile" },
   { 'C', "working-dir", OptionType::kString, offsetof(t2::DriverOptions, m_WorkingDir),
     "Set working directory before building" },
+  { 'R', "dagfile", OptionType::kString, offsetof(t2::DriverOptions, m_DAGFileName),
+    "filename of where tundra should store the mmapped dag file"},
   { 'h', "help", OptionType::kBool, offsetof(t2::DriverOptions, m_ShowHelp),
     "Show help" },
   { 'k', "continue", OptionType::kBool, offsetof(t2::DriverOptions, m_ContinueOnError),
@@ -75,7 +80,9 @@ static const struct OptionTemplate
   { 'U', "unprotected", OptionType::kBool, offsetof(t2::DriverOptions, m_RunUnprotected), "Run unprotected (same process group - for debugging)" },
 #endif
   { 'g', "ide-gen", OptionType::kBool, offsetof(t2::DriverOptions, m_IdeGen),
-    "Run IDE file generator and quit" }
+    "Run IDE file generator and quit" },
+  { 'Q', "quickstart", OptionType::kBool, offsetof(t2::DriverOptions, m_QuickstartGen),
+    "Generate tundra.lua file for a new project" }
 };
 
 static int AssignOptionValue(char* option_base, const OptionTemplate* templ, const char* value, bool is_short)
@@ -199,7 +206,7 @@ static bool InitOptions(t2::DriverOptions* options, int* argc, char*** argv)
 static void ShowHelp()
 {
   printf("\nTundra Build Processor 2.0\n");
-  printf("Copyright (C) 2013 Andreas Fredriksson\n\n");
+  printf("Copyright (C) 2010-2023 Andreas Fredriksson\n\n");
 
 #ifdef HAVE_GIT_INFO
   printf("Git branch: %s\n", g_GitBranch);
@@ -207,8 +214,6 @@ static void ShowHelp()
 #endif
 
   printf("This program comes with ABSOLUTELY NO WARRANTY.\n");
-  printf("This is free software, and you are welcome to redistribute it\n");
-  printf("under certain conditions; see the GNU GPL license for details.\n\n");
 
   printf("Usage: tundra2 [options...] [targets...]\n\n");
   printf("Options:\n");
@@ -260,6 +265,7 @@ int main(int argc, char* argv[])
     return 1;
   }
 
+  DriverInitializeTundraFilePaths(&options);
 #if defined(TUNDRA_WIN32)
   if (!options.m_RunUnprotected && nullptr == getenv("_TUNDRA2_PARENT_PROCESS_HANDLE"))
   {
@@ -356,8 +362,13 @@ int main(int argc, char* argv[])
   if (options.m_IdeGen)
   {
     // FIXME: How to detect build file for other type of generators?
-    // FIXME: Wire up remaining arguments on command line to go onto this commmand line
     GenerateIdeIntegrationFiles("tundra.lua", argc, (const char**) argv);
+    return 0;
+  }
+
+  if (options.m_QuickstartGen)
+  {
+    GenerateTemplateFiles(argc, (const char**) argv);
     return 0;
   }
 
@@ -385,7 +396,7 @@ int main(int argc, char* argv[])
       *o++ = ch;
     } while(ch);
 
-    _snprintf(mutex_name, sizeof mutex_name, "Global\\Tundra--%s", cwd_nerfed);
+    _snprintf(mutex_name, sizeof mutex_name, "Global\\Tundra--%s-%s", cwd_nerfed, options.m_DAGFileName);
     mutex_name[sizeof(mutex_name)-1] = '\0';
     bool warning_printed = false;
     HANDLE mutex = CreateMutexA(nullptr, false, mutex_name);
@@ -407,6 +418,11 @@ int main(int argc, char* argv[])
   // Initialize driver
   if (!DriverInit(&driver, &options))
     return 1;
+
+  // Initialize profiler if needed
+  if (driver.m_Options.m_ProfileOutput)
+    ProfilerInit(driver.m_Options.m_ProfileOutput, driver.m_Options.m_ThreadCount);
+
 
   BuildResult::Enum build_result = BuildResult::kSetupError;
 
@@ -462,6 +478,10 @@ int main(int argc, char* argv[])
 leave:
   DriverDestroy(&driver);
 
+  // Dump/close profiler
+  if (driver.m_Options.m_ProfileOutput)
+    ProfilerDestroy();
+
   // Dump stats
   if (options.m_DisplayStats)
   {
@@ -500,18 +520,21 @@ leave:
     printf("  stat() time:     %10.2f ms\n", TimerToSeconds(g_Stats.m_StatTimeCycles) * 1000.0);
   }
 
-  double total_time = TimerDiffSeconds(start_time, TimerGet());
-  if (total_time < 60.0)
+  if (!options.m_Quiet)
   {
-    printf("*** %s (%.2f seconds)\n", BuildResult::Names[build_result], total_time);
-  }
-  else
-  {
-    int t = (int) total_time;
-    int h = t / 3600; t -= h * 3600;
-    int m = t /   60; t -= m *   60;
-    int s = t;
-    printf("*** %s (%.2f seconds - %d:%02d:%02d)\n", BuildResult::Names[build_result], total_time, h, m, s);
+    double total_time = TimerDiffSeconds(start_time, TimerGet());
+    if (total_time < 60.0)
+    {
+      printf("*** %s (%.2f seconds)\n", BuildResult::Names[build_result], total_time);
+    }
+    else
+    {
+      int t = (int)total_time;
+      int h = t / 3600; t -= h * 3600;
+      int m = t / 60; t -= m * 60;
+      int s = t;
+      printf("*** %s (%.2f seconds - %d:%02d:%02d)\n", BuildResult::Names[build_result], total_time, h, m, s);
+    }
   }
 
   return build_result == BuildResult::kOk ? 0 : 1;

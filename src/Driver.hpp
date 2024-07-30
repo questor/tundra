@@ -38,8 +38,11 @@ struct DriverOptions
 #if defined(TUNDRA_WIN32)
   bool        m_RunUnprotected;
 #endif
+  bool        m_QuickstartGen;
   int         m_ThreadCount;
   const char *m_WorkingDir;
+  const char *m_DAGFileName;
+  const char *m_ProfileOutput;
 };
 
 void DriverOptionsInit(DriverOptions* self);
@@ -108,6 +111,8 @@ bool DriverInitData(Driver* self);
 bool DriverSaveScanCache(Driver* self);
 bool DriverSaveBuildState(Driver* self);
 bool DriverSaveDigestCache(Driver* self);
+
+void DriverInitializeTundraFilePaths(DriverOptions* driverOptions);
 
 }
 

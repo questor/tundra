@@ -9,6 +9,7 @@
 #include "BinaryWriter.hpp"
 #include "DagData.hpp"
 #include "HashTable.hpp"
+#include "FileSign.hpp"
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -35,18 +36,18 @@ static void WriteStringPtr(BinarySegment* seg, BinarySegment *str_seg, const cha
   }
 }
 
-static const char* FindStringValue(const JsonValue* obj, const char* key)
+static const char* FindStringValue(const JsonValue* obj, const char* key, const char* default_value = nullptr)
 {
   if (JsonValue::kObject != obj->m_Type)
-    return nullptr;
+    return default_value;
 
   const JsonValue *node = obj->Find(key);
 
   if (!node)
-    return nullptr;
+    return default_value;
 
   if (JsonValue::kString != node->m_Type)
-    return nullptr;
+    return default_value;
 
   return static_cast<const JsonStringValue*>(node)->m_String;
 }
@@ -136,26 +137,27 @@ struct TempNodeGuid
   }
 };
 
-struct CommonStringRecord : HashRecord
+struct CommonStringRecord
 {
   BinaryLocator m_Pointer;
 };
 
-void WriteCommonStringPtr(BinarySegment* segment, BinarySegment* str_seg, const char* ptr, HashTable* table, MemAllocLinear* scratch)
+void WriteCommonStringPtr(BinarySegment* segment, BinarySegment* str_seg, const char* ptr, HashTable<CommonStringRecord, 0>* table, MemAllocLinear* scratch)
 {
   uint32_t hash = Djb2Hash(ptr);
   CommonStringRecord* r;
-  if (nullptr == (r = static_cast<CommonStringRecord*>(HashTableLookup(table, hash, ptr))))
+  if (nullptr == (r = HashTableLookup(table, hash, ptr)))
   {
-    r = LinearAllocate<CommonStringRecord>(scratch);
-    r->m_Hash = hash;
-    r->m_String = ptr;
-    r->m_Next = nullptr;
-    r->m_Pointer = BinarySegmentPosition(str_seg);
+    CommonStringRecord r;
+    r.m_Pointer = BinarySegmentPosition(str_seg);
+    HashTableInsert(table, hash, ptr, r);
     BinarySegmentWriteStringData(str_seg, ptr);
+    BinarySegmentWritePointer(segment, r.m_Pointer);
   }
-
-  BinarySegmentWritePointer(segment, r->m_Pointer);
+  else
+  {
+    BinarySegmentWritePointer(segment, r->m_Pointer);
+  }
 }
 
 static uint32_t GetNodeFlag(const JsonObjectValue* node, const char* name, uint32_t value)
@@ -182,7 +184,7 @@ static bool WriteNodes(
     BinarySegment* str_seg,
     BinaryLocator scanner_ptrs[],
     MemAllocHeap* heap,
-    HashTable* shared_strings,
+    HashTable<CommonStringRecord, kFlagCaseSensitive>* shared_strings,
     MemAllocLinear* scratch,
     const TempNodeGuid* order,
     const int32_t* remap_table)
@@ -192,7 +194,7 @@ static bool WriteNodes(
   MemAllocLinearScope scratch_scope(scratch);
 
   size_t node_count = nodes->m_Count;
-  
+
   struct BacklinkRec
   {
     Buffer<int32_t> m_Links;
@@ -273,7 +275,7 @@ static bool WriteNodes(
       BinarySegmentWriteInt32(node_data_seg, 0);
       BinarySegmentWriteNullPointer(node_data_seg);
     }
-    
+
     const Buffer<int32_t>& backlinks = links[i].m_Links;
     if (backlinks.m_Size > 0)
     {
@@ -328,7 +330,7 @@ static bool WriteNodes(
     }
 
     uint32_t flags = 0;
-    
+
     flags |= GetNodeFlag(node, "OverwriteOutputs", NodeData::kFlagOverwriteOutputs);
     flags |= GetNodeFlag(node, "PreciousOutputs",  NodeData::kFlagPreciousOutputs);
     flags |= GetNodeFlag(node, "Expensive",        NodeData::kFlagExpensive);
@@ -391,23 +393,6 @@ static bool WriteNodeArray(BinarySegment* top_seg, BinarySegment* data_seg, cons
   return true;
 }
 
-static bool SortJsonStrings(const JsonValue* l, const JsonValue* r)
-{
-  const char* ls = l->GetString();
-  const char* rs = r->GetString();
-
-  if (ls == rs)
-    return false;
-
-  if (nullptr == ls)
-    return true;
-
-  if (nullptr == rs)
-    return false;
-
-  return strcmp(ls, rs) < 0;
-}
-
 static bool GetBoolean(const JsonObjectValue* obj, const char* name)
 {
   if (const JsonValue* val = obj->Find(name))
@@ -421,7 +406,7 @@ static bool GetBoolean(const JsonObjectValue* obj, const char* name)
   return false;
 }
 
-static bool WriteScanner(BinaryLocator* ptr_out, BinarySegment* seg, BinarySegment* array_seg, BinarySegment* str_seg, const JsonObjectValue* data, HashTable* shared_strings, MemAllocLinear* scratch)
+static bool WriteScanner(BinaryLocator* ptr_out, BinarySegment* seg, BinarySegment* array_seg, BinarySegment* str_seg, const JsonObjectValue* data, HashTable<CommonStringRecord, kFlagCaseSensitive>* shared_strings, MemAllocLinear* scratch)
 {
   if (!data)
     return false;
@@ -454,12 +439,12 @@ static bool WriteScanner(BinaryLocator* ptr_out, BinarySegment* seg, BinarySegme
     const char* path = incpaths->m_Values[i]->GetString();
     if (!path)
       return false;
-    HashAddString(&h, path);
+    HashAddPath(&h, path);
     WriteCommonStringPtr(array_seg, str_seg, path, shared_strings, scratch);
   }
 
   void* digest_space = BinarySegmentAlloc(seg, sizeof(HashDigest));
-  
+
   if (ScannerType::kGeneric == type)
   {
     uint32_t flags = 0;
@@ -477,7 +462,7 @@ static bool WriteScanner(BinaryLocator* ptr_out, BinarySegment* seg, BinarySegme
     const JsonArrayValue* nofollow_kws = FindArrayValue(data, "KeywordsNoFollow");
 
     size_t kw_count =
-      (follow_kws ? follow_kws->m_Count : 0) + 
+      (follow_kws ? follow_kws->m_Count : 0) +
       (nofollow_kws ? nofollow_kws->m_Count : 0);
 
     BinarySegmentWriteInt32(seg, (int) kw_count);
@@ -529,7 +514,7 @@ bool ComputeNodeGuids(const JsonArrayValue* nodes, int32_t* remap_table, TempNod
       return false;
 
     guid_table[i].m_Node = (int) i;
-    
+
     HashState h;
     HashInit(&h);
 
@@ -550,9 +535,10 @@ bool ComputeNodeGuids(const JsonArrayValue* nodes, int32_t* remap_table, TempNod
       }
     }
 
-      const char *annotation = FindStringValue(nobj, "Annotation");
-      if (annotation)
-        HashAddString(&h, annotation);
+    const char *annotation = FindStringValue(nobj, "Annotation");
+
+    if (annotation)
+      HashAddString(&h, annotation);
 
     if ((!action || action[0] == '\0') && !inputs && !annotation)
     {
@@ -592,10 +578,10 @@ bool ComputeNodeGuids(const JsonArrayValue* nodes, int32_t* remap_table, TempNod
 
 static bool CompileDag(const JsonObjectValue* root, BinaryWriter* writer, MemAllocHeap* heap, MemAllocLinear* scratch)
 {
-  printf("compiling mmapable DAG data..\n"); 
+  printf("compiling mmapable DAG data..\n");
 
-  HashTable shared_strings;
-  HashTableInit(&shared_strings, heap, 0);
+  HashTable<CommonStringRecord, kFlagCaseSensitive> shared_strings;
+  HashTableInit(&shared_strings, heap);
 
   BinarySegment         *main_seg      = BinaryWriterAddSegment(writer);
   BinarySegment         *node_guid_seg = BinaryWriterAddSegment(writer);
@@ -635,12 +621,11 @@ static bool CompileDag(const JsonObjectValue* root, BinaryWriter* writer, MemAll
       }
     }
   }
-  
+
   // Write magic number
   BinarySegmentWriteUint32(main_seg, DagData::MagicNumber);
 
   // Compute node guids and index remapping table.
-  // FIXME: this just leaks
   int32_t      *remap_table = HeapAllocateArray<int32_t>(heap, nodes->m_Count);
   TempNodeGuid *guid_table  = HeapAllocateArray<TempNodeGuid>(heap, nodes->m_Count);
 
@@ -802,12 +787,14 @@ static bool CompileDag(const JsonObjectValue* root, BinaryWriter* writer, MemAll
       if (const JsonObjectValue* sig = file_sigs->m_Values[i]->AsObject())
       {
         const char* path = FindStringValue(sig, "File");
-        int64_t timestamp = FindIntValue(sig, "Timestamp", -1);
-        if (!path || -1 == timestamp)
+
+        if (!path)
         {
-          fprintf(stderr, "bad FileSignatures data\n");
+          fprintf(stderr, "bad FileSignatures data (null path in File node)\n");
           return false;
         }
+
+        int64_t timestamp = GetFileInfo(path).m_Timestamp;
         WriteStringPtr(aux_seg, str_seg, path);
         char padding[4] = { 0, 0, 0, 0 };
         BinarySegmentWrite(aux_seg, padding, 4);
@@ -815,7 +802,7 @@ static bool CompileDag(const JsonObjectValue* root, BinaryWriter* writer, MemAll
       }
       else
       {
-        fprintf(stderr, "bad FileSignatures data\n");
+        fprintf(stderr, "bad FileSignatures data (FileSignatures must contain objects)\n");
         return false;
       }
     }
@@ -836,35 +823,13 @@ static bool CompileDag(const JsonObjectValue* root, BinaryWriter* writer, MemAll
       if (const JsonObjectValue* sig = glob_sigs->m_Values[i]->AsObject())
       {
         const char* path = FindStringValue(sig, "Path");
-        const JsonArrayValue* files = FindArrayValue(sig, "Files");
-        const JsonArrayValue* subdirs = FindArrayValue(sig, "SubDirs");
-        if (!path || !files || !subdirs)
+        if (!path)
         {
           fprintf(stderr, "bad GlobSignatures data\n");
           return false;
         }
 
-        // Compute digest of dir query.
-        std::sort(files->m_Values, files->m_Values + files->m_Count, SortJsonStrings);
-        std::sort(subdirs->m_Values, subdirs->m_Values + subdirs->m_Count, SortJsonStrings);
-
-        HashState h;
-        HashInit(&h);
-
-        for (size_t i = 0, count = subdirs->m_Count; i < count; ++i)
-        {
-          HashAddString(&h, subdirs->m_Values[i]->GetString());
-          HashAddSeparator(&h);
-        }
-
-        for (size_t i = 0, count = files->m_Count; i < count; ++i)
-        {
-          HashAddString(&h, files->m_Values[i]->GetString());
-          HashAddSeparator(&h);
-        }
-
-        HashDigest digest;
-        HashFinalize(&h, &digest);
+        HashDigest digest = CalculateGlobSignatureFor(path, heap, scratch);
 
         WriteStringPtr(aux_seg, str_seg, path);
         BinarySegmentWrite(aux_seg, (char*) &digest, sizeof digest);
@@ -909,7 +874,19 @@ static bool CompileDag(const JsonObjectValue* root, BinaryWriter* writer, MemAll
 
   BinarySegmentWriteInt32(main_seg, (int) FindIntValue(root, "MaxExpensiveCount", -1));
 
+  WriteStringPtr(main_seg, str_seg, FindStringValue(root, "StateFileName", ".tundra2.state"));
+  WriteStringPtr(main_seg, str_seg, FindStringValue(root, "StateFileNameTmp", ".tundra2.state.tmp"));
+
+  WriteStringPtr(main_seg, str_seg, FindStringValue(root, "ScanCacheFileName", ".tundra2.scancache"));
+  WriteStringPtr(main_seg, str_seg, FindStringValue(root, "ScanCacheFileNameTmp", ".tundra2.scancache.tmp"));
+
+  WriteStringPtr(main_seg, str_seg, FindStringValue(root, "DigestCacheFileName", ".tundra2.digestcache"));
+  WriteStringPtr(main_seg, str_seg, FindStringValue(root, "DigestCacheFileNameTmp", ".tundra2.digestcache.tmp"));
+
   HashTableDestroy(&shared_strings);
+
+  HeapFree(heap, guid_table);
+  HeapFree(heap, remap_table);
 
   return true;
 }
@@ -917,7 +894,7 @@ static bool CompileDag(const JsonObjectValue* root, BinaryWriter* writer, MemAll
 static bool CreateDagFromJsonData(char* json_memory, const char* dag_fn)
 {
   MemAllocHeap heap;
-  HeapInit(&heap, MB(256), HeapFlags::kDefault);
+  HeapInit(&heap);
 
   MemAllocLinear alloc;
   MemAllocLinear scratch;
@@ -957,7 +934,7 @@ static bool CreateDagFromJsonData(char* json_memory, const char* dag_fn)
   LinearAllocDestroy(&scratch);
   LinearAllocDestroy(&alloc);
 
-  HeapDestroy(&heap);
+  t2::HeapDestroy(&heap);
   return result;
 }
 
@@ -980,27 +957,44 @@ static bool RunExternalTool(const char* options, ...)
     PathFormat(dag_gen_path, &pbuf);
   }
 
+
+  const char* cmdline_to_use;
+
   char option_str[1024];
+  char cmdline[1024];
   va_list args;
   va_start(args, options);
   vsnprintf(option_str, sizeof option_str, options, args);
   va_end(args);
   option_str[sizeof(option_str)-1] = '\0';
 
-  const char* quotes = "";
-  if (strchr(dag_gen_path, ' '))
-    quotes = "\"";
+  EnvVariable env_var;
+  env_var.m_Name = "TUNDRA_FRONTEND_OPTIONS";
+  env_var.m_Value = option_str;
 
-  char cmdline[1024];
-  snprintf(cmdline, sizeof cmdline, "%s%s%s %s", quotes, dag_gen_path, quotes, option_str);
-  cmdline[sizeof(cmdline)-1] = '\0';
+  if (const char* env_option = getenv("TUNDRA_DAGTOOL_FULLCOMMANDLINE"))
+  {
+    cmdline_to_use = env_option;
+  }
+  else
+  {
+    const char* quotes = "";
+    if (strchr(dag_gen_path, ' '))
+      quotes = "\"";
+
+    snprintf(cmdline, sizeof cmdline, "%s%s%s %s", quotes, dag_gen_path, quotes, option_str);
+    cmdline[sizeof(cmdline)-1] = '\0';
+
+    cmdline_to_use = cmdline;
+  }
 
   const bool echo = (GetLogFlags() & kDebug) ? true : false;
-  ExecResult result = ExecuteProcess(cmdline, 0, nullptr, 0, echo, nullptr);
+
+  ExecResult result = ExecuteProcess(cmdline_to_use, 1, &env_var, 0, echo, nullptr);
 
   if (0 != result.m_ReturnCode)
   {
-    Log(kError, "DAG generator driver failed: %s", cmdline);
+    Log(kError, "DAG generator driver failed: %s", cmdline_to_use);
     return false;
   }
 
@@ -1037,6 +1031,7 @@ bool GenerateDag(const char* script_fn, const char* dag_fn)
   FILE* f = fopen(json_filename, "rb");
   if (!f)
   {
+    free(json_memory);
     Log(kError, "couldn't open %s for reading", json_filename);
     return false;
   }
@@ -1062,38 +1057,60 @@ bool GenerateDag(const char* script_fn, const char* dag_fn)
   return success;
 }
 
-bool GenerateIdeIntegrationFiles(const char* build_file, int argc, const char** argv)
+static void CreateCommandLine(MemAllocHeap* heap, Buffer<char>* args, int argc, const char** argv)
 {
-  MemAllocHeap heap;
-  HeapInit(&heap, MB(1), HeapFlags::kDefault);
-
-  Buffer<char> args;
-  BufferInit(&args);
-
   for (int i = 0; i < argc; ++i)
   {
     if (i > 0)
-      BufferAppendOne(&args, &heap, ' ');
+      BufferAppendOne(args, heap, ' ');
 
     const size_t arglen = strlen(argv[i]);
     const bool has_spaces = nullptr != strchr(argv[i], ' ');
 
     if (has_spaces)
-      BufferAppendOne(&args, &heap, '"');
+      BufferAppendOne(args, heap, '"');
 
-    BufferAppend(&args, &heap, argv[i], arglen);
+    BufferAppend(args, heap, argv[i], arglen);
 
     if (has_spaces)
-      BufferAppendOne(&args, &heap, '"');
+      BufferAppendOne(args, heap, '"');
   }
 
-  BufferAppendOne(&args, &heap, '\0');
+  BufferAppendOne(args, heap, '\0');
+}
+
+bool GenerateIdeIntegrationFiles(const char* build_file, int argc, const char** argv)
+{
+  MemAllocHeap heap;
+  HeapInit(&heap);
+
+  Buffer<char> args;
+  BufferInit(&args);
+  CreateCommandLine(&heap, &args, argc, argv);
 
   // Run DAG generator.
   bool result = RunExternalTool("generate-ide-files %s %s", build_file, args.m_Storage);
 
   BufferDestroy(&args, &heap);
-  HeapDestroy(&heap);
+  t2::HeapDestroy(&heap);
+
+  return result;
+}
+
+bool GenerateTemplateFiles(int argc, const char** argv)
+{
+  MemAllocHeap heap;
+  HeapInit(&heap);
+
+  Buffer<char> args;
+  BufferInit(&args);
+  CreateCommandLine(&heap, &args, argc, argv);
+
+  // Run DAG generator.
+  bool result = RunExternalTool("create-template-file %s", args.m_Storage);
+
+  BufferDestroy(&args, &heap);
+  t2::HeapDestroy(&heap);
 
   return result;
 }

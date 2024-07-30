@@ -86,7 +86,7 @@ int main(int argc, char** argv)
   InitCommon();
 
   MemAllocHeap heap;
-  HeapInit(&heap, MB(256), HeapFlags::kDefault);
+  HeapInit(&heap);
 
   bool profile = false;
 
@@ -107,8 +107,8 @@ int main(int argc, char** argv)
     LuaProfilerReport();
 
   DestroyLuaState(L);
-    
-  HeapDestroy(&heap);
+
+  t2::HeapDestroy(&heap);
 
 	return success ? 0 : 1;
 }

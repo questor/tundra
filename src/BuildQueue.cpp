@@ -11,6 +11,8 @@
 #include "Stats.hpp"
 #include "StatCache.hpp"
 #include "FileSign.hpp"
+#include "Hash.hpp"
+#include "Profiler.hpp"
 
 #include <stdio.h>
 
@@ -28,9 +30,9 @@ namespace t2
   }
 
 
-  static void ThreadStateInit(ThreadState* self, BuildQueue* queue, size_t heap_size, size_t scratch_size, int index)
+  static void ThreadStateInit(ThreadState* self, BuildQueue* queue, size_t scratch_size, int index)
   {
-    HeapInit(&self->m_LocalHeap, heap_size, HeapFlags::kDefault);
+    HeapInit(&self->m_LocalHeap);
     LinearAllocInit(&self->m_ScratchAlloc, &self->m_LocalHeap, scratch_size, "thread-local scratch");
     self->m_ThreadIndex = index;
     self->m_Queue       = queue;
@@ -188,7 +190,7 @@ namespace t2
 
     if (file_count != prev_state->m_OutputFiles.GetCount())
       return true;
-    
+
     for (int i = 0; i < file_count; ++i)
     {
       if (0 != strcmp(node_data->m_OutputFiles[i].m_Filename, prev_state->m_OutputFiles[i]))
@@ -202,7 +204,7 @@ namespace t2
   {
     for (const FrozenFileAndHash& f : node->m_OutputFiles)
     {
-      FileInfo i = StatCacheStat(stat_cache, f.m_Filename, f.m_Hash);
+      FileInfo i = StatCacheStat(stat_cache, f.m_Filename, f.m_FilenameHash);
 
       if (!i.Exists())
         return true;
@@ -286,19 +288,19 @@ namespace t2
       HashAddSeparator(&sighash);
     }
 
+    // Roll back scratch allocator after scanning only - filenames are being retained between scans
+    MemAllocLinearScope alloc_scope(&thread_state->m_ScratchAlloc);
+
     const ScannerData* scanner = node_data->m_Scanner;
 
     for (const FrozenFileAndHash& input : node_data->m_InputFiles)
     {
       // Add path and timestamp of every direct input file.
-      HashAddString(&sighash, input.m_Filename);
-      ComputeFileSignature(&sighash, stat_cache, digest_cache, input.m_Filename, input.m_Hash, config.m_ShaDigestExtensions, config.m_ShaDigestExtensionCount);
+      HashAddPath(&sighash, input.m_Filename);
+      ComputeFileSignature(&sighash, stat_cache, digest_cache, input.m_Filename, input.m_FilenameHash, config.m_ShaDigestExtensions, config.m_ShaDigestExtensionCount);
 
       if (scanner)
       {
-        // Roll back scratch allocator between scans
-        MemAllocLinearScope alloc_scope(&thread_state->m_ScratchAlloc);
-
         ScanInput scan_input;
         scan_input.m_ScannerConfig = scanner;
         scan_input.m_ScratchAlloc  = &thread_state->m_ScratchAlloc;
@@ -314,8 +316,8 @@ namespace t2
           {
             // Add path and timestamp of every indirect input file (#includes)
             const FileAndHash& path = scan_output.m_IncludedFiles[i];
-            HashAddString(&sighash, path.m_Filename);
-            ComputeFileSignature(&sighash, stat_cache, digest_cache, path.m_Filename, path.m_Hash, config.m_ShaDigestExtensions, config.m_ShaDigestExtensionCount);
+            HashAddPath(&sighash, path.m_Filename);
+            ComputeFileSignature(&sighash, stat_cache, digest_cache, path.m_Filename, path.m_FilenameHash, config.m_ShaDigestExtensions, config.m_ShaDigestExtensionCount);
           }
         }
       }
@@ -346,7 +348,12 @@ namespace t2
     {
       // The input signature has changed (either direct inputs or includes)
       // We need to rebuild this node.
-      Log(kSpam, "T=%d: building %s - input signature changed", thread_state->m_ThreadIndex, node_data->m_Annotation.Get());
+      char oldDigest[kDigestStringSize];
+      char newDigest[kDigestStringSize];
+      DigestToString(oldDigest, prev_state->m_InputSignature);
+      DigestToString(newDigest, node->m_InputSignature);
+
+      Log(kSpam, "T=%d: building %s - input signature changed. was:%s now:%s", thread_state->m_ThreadIndex, node_data->m_Annotation.Get(), oldDigest, newDigest);
       next_state = BuildProgress::kRunAction;
     }
     else if (prev_state->m_BuildResult != 0)
@@ -406,6 +413,7 @@ namespace t2
     StatCache         *stat_cache   = queue->m_Config.m_StatCache;
     const char        *annotation   = node_data->m_Annotation;
     int                job_id       = thread_state->m_ThreadIndex;
+    int                echo_annotations = 0 != (queue->m_Config.m_Flags & BuildQueueConfig::kFlagEchoAnnotations);
     int                echo_cmdline = 0 != (queue->m_Config.m_Flags & BuildQueueConfig::kFlagEchoCommandLines);
 
     // Repack frozen env to pointers on the stack.
@@ -439,7 +447,7 @@ namespace t2
       {
         Log(kDebug, "Removing output file %s before running action", output.m_Filename.Get());
         remove(output.m_Filename);
-        StatCacheMarkDirty(stat_cache, output.m_Filename, output.m_Hash);
+        StatCacheMarkDirty(stat_cache, output.m_Filename, output.m_FilenameHash);
       }
     }
 
@@ -447,7 +455,8 @@ namespace t2
     {
       Log(kSpam, "Launching pre-action process");
       TimingScope timing_scope(&g_Stats.m_ExecCount, &g_Stats.m_ExecTimeCycles);
-      result = ExecuteProcess(pre_cmd_line, env_count, env_vars, job_id, echo_cmdline, "(pre-build command)");
+      ProfilerScope prof_scope("Pre-build", job_id);
+      result = ExecuteProcess(pre_cmd_line, env_count, env_vars, job_id, echo_cmdline, echo_annotations ? "(pre-build command)" : nullptr);
       Log(kSpam, "Process return code %d", result.m_ReturnCode);
     }
 
@@ -455,13 +464,14 @@ namespace t2
     {
       Log(kSpam, "Launching process");
       TimingScope timing_scope(&g_Stats.m_ExecCount, &g_Stats.m_ExecTimeCycles);
-      result = ExecuteProcess(cmd_line, env_count, env_vars, job_id, echo_cmdline, annotation);
+      ProfilerScope prof_scope(annotation, job_id);
+      result = ExecuteProcess(cmd_line, env_count, env_vars, job_id, echo_cmdline, echo_annotations ? annotation : nullptr);
       Log(kSpam, "Process return code %d", result.m_ReturnCode);
     }
 
     for (const FrozenFileAndHash& output : node_data->m_OutputFiles)
     {
-      StatCacheMarkDirty(stat_cache, output.m_Filename, output.m_Hash);
+      StatCacheMarkDirty(stat_cache, output.m_Filename, output.m_FilenameHash);
     }
 
     MutexLock(queue_lock);
@@ -484,7 +494,7 @@ namespace t2
         {
           Log(kDebug, "Removing output file %s from failed build", output.m_Filename.Get());
           remove(output.m_Filename);
-          StatCacheMarkDirty(stat_cache, output.m_Filename, output.m_Hash);
+          StatCacheMarkDirty(stat_cache, output.m_Filename, output.m_FilenameHash);
         }
       }
 
@@ -656,7 +666,7 @@ namespace t2
     // If we're a worker thread, keep running until we quit.
     if (0 != thread_index)
       return true;
-    
+
     // We're the main thread. Just loop until there's no more nodes and then move on to the next pass.
     return queue->m_PendingNodeCount > 0;
   }
@@ -691,7 +701,7 @@ namespace t2
     ThreadState *thread_state = static_cast<ThreadState*>(param);
 
     LinearAllocSetOwner(&thread_state->m_ScratchAlloc, ThreadCurrent());
-    
+
     BuildLoop(thread_state);
 
     return 0;
@@ -699,6 +709,7 @@ namespace t2
 
   void BuildQueueInit(BuildQueue* queue, const BuildQueueConfig* config)
   {
+    ProfilerScope prof_scope("Tundra BuildQueueInit", 0);
     CHECK(config->m_MaxExpensiveCount > 0 && config->m_MaxExpensiveCount <= config->m_ThreadCount);
 
     MutexInit(&queue->m_Lock);
@@ -745,7 +756,7 @@ namespace t2
     {
       ThreadState* thread_state = &queue->m_ThreadState[i];
 
-      ThreadStateInit(thread_state, queue, MB(64), MB(32), i);
+      ThreadStateInit(thread_state, queue, MB(32), i);
 
       if (i > 0)
       {
@@ -757,6 +768,7 @@ namespace t2
 
   void BuildQueueDestroy(BuildQueue* queue)
   {
+    ProfilerScope prof_scope("Tundra BuildQueueDestroy", 0);
     Log(kDebug, "destroying build queue");
     const BuildQueueConfig* config = &queue->m_Config;
 

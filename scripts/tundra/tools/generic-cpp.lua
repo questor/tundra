@@ -31,7 +31,6 @@ local function generic_cpp_setup(env)
     local implicit_inputs = nil
     
     if is_pch_source then
-      
       label = 'Precompiled header'
       pass = nodegen.resolve_pass(env:get('_PCH_PASS', ''))
       action = "$(PCHCOMPILE)"
@@ -85,7 +84,7 @@ function apply(_outer_env, options)
   _outer_env:add_setup_function(generic_cpp_setup)
 
   _outer_env:set_many {
-    ["IGNORED_AUTOEXTS"] = { ".h", ".hpp", ".hh", ".hxx", ".inl" },
+    ["IGNORED_AUTOEXTS"] = { ".h", ".hpp", ".hh", ".hxx", ".inl", ".natvis" },
     ["CCEXTS"] = { "c" },
     ["CXXEXTS"] = { "cpp", "cxx", "cc" },
     ["OBJCEXTS"] = { "m" },

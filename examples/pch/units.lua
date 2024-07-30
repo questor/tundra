@@ -26,8 +26,8 @@ Program {
 		"subdir/src5.cpp",
 	},
 }
-
 Default "testpch"
+
 -- This shows how to use precompiled headers with globbing.
 -- It was initially used as a test to get globbing and precompiled headers working together correctly.
 Program {
